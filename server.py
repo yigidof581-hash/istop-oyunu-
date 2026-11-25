@@ -19,6 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
+APP_VERSION = 'v10-lobbyfix'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -79,6 +80,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == '/' or path == '':
             self._html(get_index_html())
+            return
+
+        # Surum bilgisi (deploy dogrulamasi)
+        if path == '/api/version':
+            self._send({'ok': True, 'version': APP_VERSION})
             return
 
         # Oda listesi
@@ -610,7 +616,7 @@ def reset_after_battle(game):
 # İNDEX.HTML (gömülü)
 # ============================================================
 def get_index_html():
-    return INDEX_HTML
+    return INDEX_HTML.replace('__BUILD__', APP_VERSION)
 
 
 INDEX_HTML = r"""<!DOCTYPE html>
@@ -700,6 +706,7 @@ input{font:inherit;outline:none}
 
 <div id="screen-room" class="screen">
 <div id="room-header">Oda</div>
+<div id="room-hint" style="font-size:0.72rem;opacity:0.65;margin:-4px 0 6px 0;text-align:center;"></div>
 <div class="player-list" id="player-list"></div>
 <button class="btn btn-green" id="start-btn" style="display:none;">🎮 Oyunu Başlat</button>
 <button class="btn btn-small" id="leave-btn" style="background:#555;">Odadan Ayrıl</button>
@@ -721,6 +728,8 @@ input{font:inherit;outline:none}
 </div>
 <script>
 // ========== DURUM ==========
+const BUILD='__BUILD__';
+console.log('ISTOP build',BUILD);
 let uid=null,nick='',gameId=null,isHost=false,ebem=false,eliminated=false,lastVer=0;
 let curPhase=null,timers=[],myHit=false,stateCache={},pollTimer=null;
 function clrT(){timers.forEach(t=>clearTimeout(t));timers=[]}
@@ -781,13 +790,22 @@ function pollRooms(){
 // ========== ODA İŞLEMLERİ ==========
 function createRoom(){
   api('POST','/api/rooms',{uid,nickname:nick}).then(r=>{
-    if(r.ok){
-      gameId=r.gameId;
-      isHost=true;
-      console.log('Oda olusturuldu, isHost=true, gameId='+gameId);
-      enterRoom();
+    if(!r.ok){alert(r.error||'Oda olusturulamadi');return}
+    if(r.alreadyIn){
+      // Eski bir odada kaydimiz kalmis: cikip temiz oda kur
+      console.log('Eski odada kalinti var, cikiliyor:',r.gameId);
+      api('POST','/api/rooms/'+r.gameId+'/leave',{uid}).then(()=>{
+        api('POST','/api/rooms',{uid,nickname:nick}).then(r2=>{
+          if(r2.ok&&r2.gameId){gameId=r2.gameId;isHost=true;enterRoom();}
+          else alert(r2.error||'Oda olusturulamadi');
+        }).catch(e=>alert('Baglanti hatasi'));
+      }).catch(()=>{gameId=r.gameId;enterRoom();});
+      return;
     }
-    else alert(r.error||'Oda olusturulamadi');
+    gameId=r.gameId;
+    isHost=true;
+    console.log('Oda olusturuldu, isHost=true, gameId='+gameId+' build='+BUILD);
+    enterRoom();
   }).catch(e=>{alert('Baglanti hatasi');console.error(e)});
 }
 function joinRoom(gid){
@@ -799,29 +817,41 @@ function joinRoom(gid){
 function enterRoom(){
   sc('screen-room');
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
-  // Oyuncu listesini göstermek için önce state'i çek
   loadPlayers();
   pollGame(); // oda içinde state poll
+}
+// Lobide ekrani state'ten ciz (her poll'da cagrilir)
+function renderRoom(g){
+  if(!g||!g.players)return;
+  isHost = (g.host === uid);
+  const list=document.getElementById('player-list');
+  const cnt=Object.keys(g.players).length;
+  let h='';
+  Object.keys(g.players).forEach(u=>{
+    const p=g.players[u],me=u===uid,host=u===g.host;
+    h+=`<div class="pl-item"><span>${host?'👑':'✅'}</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}${host?' - kurucu':''}</span></div>`;
+  });
+  list.innerHTML=h;
+  const sb=document.getElementById('start-btn');
+  if(isHost){
+    sb.style.display='block';
+    sb.disabled = cnt<2;
+    sb.textContent = cnt>=2 ? '🎮 Oyunu Başlat ('+cnt+'/4)' : 'En az 2 oyuncu ('+cnt+'/4)';
+  }else{
+    sb.style.display='none';
+  }
+  const hd=document.getElementById('room-hint');
+  if(hd){
+    hd.textContent = isHost
+      ? (cnt>=2 ? 'Sen kurucusun 👑 Başlat’a basabilirsin' : 'Sen kurucusun 👑 Arkadaşını bekle (2 kişi gerekli)')
+      : 'Kurucunun başlatması bekleniyor...';
+  }
+  st('Oyuncu: '+cnt+'/4');
 }
 function loadPlayers(){
   api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
     if(!r.ok||!r.state)return;
-    const g=r.state;if(!g||!g.players)return;
-    // State'ten host bilgisini al, ona göre isHost'u güncelle
-    isHost = (g.host === uid);
-    const list=document.getElementById('player-list');
-    let h='';const cnt=Object.keys(g.players).length;
-    Object.keys(g.players).forEach(u=>{
-      const p=g.players[u],me=u===uid;
-      h+=`<div class="pl-item"><span>✅</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}</span></div>`;
-    });
-    list.innerHTML=h;
-    const sb=document.getElementById('start-btn');
-    const showStart = isHost && cnt>=2;
-    if(showStart){sb.style.display='block';sb.disabled=cnt<2;sb.textContent=cnt>=2?'🎮 Oyunu Başlat ('+cnt+'/4)':'En az 2 oyuncu ('+cnt+'/4)';}
-    else sb.style.display='none';
-    st('Oyuncu: '+cnt+'/4');
-    if(g.phase!=='waiting'&&g.status==='playing'){curPhase='live';enterGame(g);}
+    renderRoom(r.state);
   }).catch(e=>console.warn('loadPlayers err',e));
 }
 
@@ -843,7 +873,7 @@ function pollGame(){
       if(g.status==='playing'&&!curPhase){curPhase='live';sc('screen-game');Snd.i();enterGame(g);}
       else if(g.status==='playing'&&curPhase){gameTick(g);}
       else if(g.status==='finished'){showResult(g);}
-      else if(g.status==='lobby'&&curPhase){curPhase=null;loadPlayers();}
+      else if(g.status==='lobby'){curPhase=null;renderRoom(g);}
       if(g.message)msg(g.message);
     }).catch(e=>{console.warn('poll err',e)});
   },250);
@@ -959,7 +989,12 @@ document.addEventListener('DOMContentLoaded',()=>{
   }
   document.getElementById('create-btn').addEventListener('click',createRoom);
   document.getElementById('logout-btn').addEventListener('click',doLogout);
-  document.getElementById('start-btn').addEventListener('click',()=>{if(!isHost||!gameId)return;api('POST','/api/rooms/'+gameId+'/start',{uid}).catch(()=>{});});
+  document.getElementById('start-btn').addEventListener('click',()=>{
+    if(!isHost||!gameId)return;
+    api('POST','/api/rooms/'+gameId+'/start',{uid}).then(r=>{
+      if(!r.ok){msg(r.error||'Baslatilamadi');alert(r.error||'Oyun baslatilamadi');}
+    }).catch(e=>{alert('Baglanti hatasi');console.warn(e)});
+  });
   document.getElementById('leave-btn').addEventListener('click',leaveRoom);
   document.getElementById('rematch-btn').addEventListener('click',()=>{
     if(!gameId)return;
