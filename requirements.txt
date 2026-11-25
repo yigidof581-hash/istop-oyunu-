@@ -1,1 +1,1 @@
-# Bu dosya boş olabilir - tüm bağımlılıklar Python standart kütüphanesinde
+# Python standart kütüphanesi - ek bağımlılık gerekmez
