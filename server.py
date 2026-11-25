@@ -798,13 +798,13 @@ function enterRoom(){
 }
 function loadPlayers(){
   api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
-    if(!r.ok)return;
+    if(!r.ok||!r.state)return;
     const g=r.state;if(!g||!g.players)return;
     const list=document.getElementById('player-list');
     let h='';const cnt=Object.keys(g.players).length;
     Object.keys(g.players).forEach(u=>{
-      const p=g.players[u],me=u===uid;const s=(p.lives||0)>0&&!g.eliminated[u]?'✅':'☠️';
-      h+=`<div class="pl-item"><span>${s}</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}</span></div>`;
+      const p=g.players[u],me=u===uid;
+      h+=`<div class="pl-item"><span>✅</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}</span></div>`;
     });
     list.innerHTML=h;
     const sb=document.getElementById('start-btn');
@@ -813,7 +813,7 @@ function loadPlayers(){
     else sb.style.display='none';
     st('Oyuncu: '+cnt+'/4');
     if(g.phase!=='waiting'&&g.status==='playing'){curPhase='live';enterGame(g);}
-  }).catch(()=>{});
+  }).catch(e=>console.warn('loadPlayers err',e));
 }
 
 // ========== OYUN POLL ==========
@@ -822,10 +822,11 @@ function pollGame(){
   pollTimer=setInterval(()=>{
     if(!gameId||!uid)return;
     api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
-      if(!r.ok){if(r.error.includes('Not in game'))leaveRoom();return;}
+      if(!r.ok||!r.state)return;
       const g=r.state;if(!g)return;
       stateCache=g;
-      if(g.status==='deleted'||!g.players[uid]){leaveRoom();return}
+      if(g.status==='deleted'){leaveRoom();return}
+      if(!g.players||!g.players[uid]){leaveRoom();return}
       if(g.phaseVersion>lastVer){lastVer=g.phaseVersion;clrT();myHit=false;}
       cards(g);
       if(g.status==='playing'&&!curPhase){curPhase='live';sc('screen-game');Snd.i();enterGame(g);}
@@ -833,7 +834,7 @@ function pollGame(){
       else if(g.status==='finished'){showResult(g);}
       else if(g.status==='lobby'&&curPhase){curPhase=null;loadPlayers();}
       if(g.message)msg(g.message);
-    }).catch(()=>{});
+    }).catch(e=>{console.warn('poll err',e)});
   },250);
 }
 
