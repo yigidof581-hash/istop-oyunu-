@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v18-felt'
+APP_VERSION = 'v19-exitfix'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -1185,6 +1185,7 @@ function leaveRoom(){
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
   clearSession();
+  uid=null;gameId=null;nick='';isHost=false;ebem=false;eliminated=false;myHit=false;
   goLobby();
 }
 function doLogout(){
