@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v10-lobbyfix'
+APP_VERSION = 'v11-soundfix'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -743,7 +743,10 @@ function vib(){try{if(navigator.vibrate)navigator.vibrate([180,90,180])}catch(e)
 function ntf(t,b){try{if('Notification'in window&&Notification.permission==='granted')new Notification(t,{body:b});else if('Notification'in window&&Notification.permission!=='denied')Notification.requestPermission().then(p=>{if(p==='granted')new Notification(t,{body:b})})}catch(e){}}
 
 // ========== SES ==========
-const Snd={ctx:null,i(){try{this.ctx=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}},p(f,d,t,v=0.3){if(!this.ctx)return;try{const o=this.ctx.createOscillator(),a=this.ctx.createGain();o.type=t||'sine';o.frequency.value=f;a.gain.value=v;o.connect(a);a.connect(this.ctx.destination);o.start();setTimeout(()=>{o.stop();a.disconnect()},d)}catch(e){}},bip(){this.p(880,100,'sine',0.32)},alert(){this.p(660,70,'sine',0.28);setTimeout(()=>this.p(990,100,'sine',0.3),80)},send(){this.p(440,40,'square',0.16);setTimeout(()=>this.p(660,60,'sine',0.2),40)},caught(){this.p(880,50,'sine',0.26);setTimeout(()=>this.p(1100,120,'sine',0.2),50)},istop(){this.p(300,160,'sawtooth',0.2);setTimeout(()=>this.p(200,260,'sawtooth',0.16),160)},hit(){this.p(200,220,'square',0.16)},win(){[660,880,1100,1320].forEach((f,i)=>setTimeout(()=>this.p(f,110,'sine',0.26),i*80))},lose(){this.p(300,250,'sine',0.2);setTimeout(()=>this.p(200,320,'sine',0.16),230)}};
+const Snd={ctx:null,oscs:[],
+i(){try{if(!this.ctx||this.ctx.state==='closed')this.ctx=new(window.AudioContext||window.webkitAudioContext)();if(this.ctx.state==='suspended')this.ctx.resume()}catch(e){}},
+stopAll(){try{this.oscs.forEach(o=>{try{o.stop()}catch(e){}})}catch(e){}this.oscs=[]},
+p(f,d,t,v=0.3){if(!this.ctx)return;try{const o=this.ctx.createOscillator(),a=this.ctx.createGain();o.type=t||'sine';o.frequency.value=f;a.gain.value=v;o.connect(a);a.connect(this.ctx.destination);o.start();this.oscs.push(o);setTimeout(()=>{try{o.stop();a.disconnect()}catch(e){};const k=this.oscs.indexOf(o);if(k>=0)this.oscs.splice(k,1)},d)}catch(e){}},bip(){this.p(880,100,'sine',0.32)},alert(){this.p(660,70,'sine',0.28);setTimeout(()=>this.p(990,100,'sine',0.3),80)},send(){this.p(440,40,'square',0.16);setTimeout(()=>this.p(660,60,'sine',0.2),40)},caught(){this.p(880,50,'sine',0.26);setTimeout(()=>this.p(1100,120,'sine',0.2),50)},istop(){this.p(300,160,'sawtooth',0.2);setTimeout(()=>this.p(200,260,'sawtooth',0.16),160)},hit(){this.p(200,220,'square',0.16)},win(){[660,880,1100,1320].forEach((f,i)=>setTimeout(()=>this.p(f,110,'sine',0.26),i*80))},lose(){this.p(300,250,'sine',0.2);setTimeout(()=>this.p(200,320,'sine',0.16),230)}};
 
 // ========== API ==========
 const API=window.location.origin;
@@ -879,21 +882,29 @@ function pollGame(){
   },250);
 }
 
+let lastPhaseSig='';
 function enterGame(g){cards(g);gameTick(g);}
 function gameTick(g){
   const pls=g.players,eli=g.eliminated||{},me=pls[uid];
   eliminated=!!eli[uid]||!me||(me.lives||0)<=0;
   ebem=g.currentEbe===uid;
-  if(eliminated){document.getElementById('ac').innerHTML='<div style="opacity:0.5;font-size:1rem;">☠️ Elendin. İzliyorsun...</div>';return}
   const ac=document.getElementById('ac');
+  const sig=(g.phase||'')+'#'+(g.phaseVersion||0)+'#'+(g.selectedColor||'')+'#'+(g.currentEbe||'');
+  const fresh=(sig!==lastPhaseSig);
+  if(fresh)lastPhaseSig=sig;
+  if(eliminated){
+    if(fresh)ac.innerHTML='<div style="opacity:0.5;font-size:1rem;">☠️ Elendin. İzliyorsun...</div>';
+    return;
+  }
   switch(g.phase){
-    case'ebe_turn':phEbe(g,ac);break;
-    case'catching':phCatch(g,ac);break;
-    case'istop':phIstop(g,ac);break;
-    case'color_battle':phColor(g,ac);break;
+    case'ebe_turn':phEbe(g,ac,fresh);break;
+    case'catching':phCatch(g,ac,fresh);break;
+    case'istop':phIstop(g,ac,fresh);break;
+    case'color_battle':phColor(g,ac,fresh);break;
   }
 }
-function phEbe(g,ac){
+function phEbe(g,ac,fresh){
+  if(!fresh)return;
   if(ebem){
     const others=Object.keys(g.players).filter(u=>u!==uid&&!g.eliminated[u]&&(g.players[u].lives||0)>0);
     if(others.length===0){api('POST','/api/game/'+gameId+'/rematch',{uid});return}
@@ -906,8 +917,9 @@ function throwTo(tu){
   Snd.send();
   api('POST','/api/game/'+gameId+'/throw',{uid,target:tu}).catch(()=>{});
 }
-function phCatch(g,ac){
+function phCatch(g,ac,fresh){
   if(g.targetPlayer===uid&&!eliminated){
+    if(!fresh)return;
     const rem=Math.max(0,Math.floor((g.catchDeadline-Date.now())/1000));
     ac.innerHTML=`<div id="cd">${rem}</div><button id="catch-btn" onclick="doCatch()">🏀 YAKALA!</button>`;
     Snd.alert();vib();ntf('İstop','Sana top geldi!');
@@ -915,10 +927,11 @@ function phCatch(g,ac){
       const iv=setInterval(()=>{const r=Math.max(0,Math.floor((g.catchDeadline-Date.now())/1000));const el=document.getElementById('cd');if(el)el.textContent=String(r);if(r<=0)clearInterval(iv);},150);
       timers.push(iv);timers.push(setTimeout(()=>clearInterval(iv),5000));
     }
-  }else{ac.innerHTML='<div style="opacity:0.5;font-size:1rem;">⏳ Top yolda...</div>'}
+  }else if(fresh){ac.innerHTML='<div style="opacity:0.5;font-size:1rem;">⏳ Top yolda...</div>'}
 }
 function doCatch(){if(!gameId)return;Snd.caught();vib();api('POST','/api/game/'+gameId+'/catch',{uid}).catch(()=>{});}
-function phIstop(g,ac){
+function phIstop(g,ac,fresh){
+  if(!fresh)return;
   ac.innerHTML=ebem?`<button id="istop-btn" onclick="pickColor()">🛑 İSTOP!</button>`:'<div style="opacity:0.5;font-size:1.2rem;">🛑 İSTOP!</div>';
   Snd.istop();vib();ntf('İstop','Top kaçtı!');
 }
@@ -927,7 +940,8 @@ function pickColor(){
   Snd.bip();
 }
 function pickC(c){Snd.send();api('POST','/api/game/'+gameId+'/color-pick',{uid,color:c}).catch(()=>{});}
-function phColor(g,ac){
+function phColor(g,ac,fresh){
+  if(!fresh)return;
   myHit=false;
   if(ebem||eliminated){ac.innerHTML='<div style="opacity:0.5;font-size:1rem;">🔍 Aranıyor...</div>';return}
   const tc=g.selectedColor||'green',wc=tc==='green'?'red':'green';
@@ -959,7 +973,8 @@ let resultShown=false;
 
 // ========== ODA AYRIL ==========
 function leaveRoom(){
-  clrT();curPhase=null;lastVer=0;ebem=false;eliminated=false;myHit=false;resultShown=false;
+  clrT();curPhase=null;lastVer=0;ebem=false;eliminated=false;myHit=false;resultShown=false;lastPhaseSig='';
+  Snd.stopAll();
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
   gameId=null;isHost=false;
@@ -968,6 +983,7 @@ function leaveRoom(){
 function doLogout(){
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+  Snd.stopAll();clrT();lastPhaseSig='';
   uid=null;gameId=null;isHost=false;curPhase=null;lastVer=0;
   document.getElementById('nick-input').value='';
   sc('screen-nick');
