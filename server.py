@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v13-exitbtn'
+APP_VERSION = 'v14-exitlabel'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -681,7 +681,7 @@ input{font:inherit;outline:none}
 .btn:disabled{opacity:0.35;pointer-events:none}
 .btn-circle{width:120px;height:120px;border-radius:50%;display:flex;align-items:center;justify-content:center}
 #status-bar{flex-shrink:0;padding:4px 8px;font-size:0.68rem;color:rgba(255,255,255,0.5);text-align:center;background:rgba(0,0,0,0.12);min-height:16px}
-#game-exit-btn{position:absolute;right:10px;bottom:42px;width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,255,255,0.25);background:rgba(0,0,0,0.45);color:#fff;font-size:14px;line-height:1;padding:0;z-index:20;cursor:pointer}
+#game-exit-btn{position:absolute;right:10px;bottom:42px;min-width:66px;height:30px;padding:0 12px;border-radius:15px;border:1px solid rgba(255,255,255,0.25);background:rgba(0,0,0,0.45);color:#fff;font-size:0.7rem;line-height:1;z-index:20;cursor:pointer;font-family:inherit}
 #game-exit-btn:active{background:rgba(231,76,60,0.8)}
 .screen{position:absolute;inset:0;z-index:5;display:none;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:16px;background:#1a1a2e}
 #screen-nick{display:flex}
@@ -748,7 +748,7 @@ input{font:inherit;outline:none}
 <div id="player-bar"></div>
 <div id="action"><div id="msg">Oyun başlıyor...</div><div id="ac"></div></div>
 <div id="status-bar">📍</div>
-<button id="game-exit-btn" title="Oyundan çık" aria-label="Oyundan çık">✕</button>
+<button id="game-exit-btn" title="Oyundan çık" aria-label="Oyundan çık">Çıkış</button>
 </div>
 
 <div id="screen-result">
