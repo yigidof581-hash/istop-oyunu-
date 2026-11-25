@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v14-exitlabel'
+APP_VERSION = 'v15-kickghost'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -33,6 +33,94 @@ def touch(game):
     """Oda son hareket zamanini guncelle (bos oda temizligi icin)."""
     if game:
         game['updatedAt'] = time.time()
+
+PLAYER_TIMEOUT_PLAYING = 90   # oyun icinde baglanti kopma toleransi (sn)
+PLAYER_TIMEOUT_LOBBY = 180    # lobide bekleme toleransi (sn)
+
+def remove_player(game, uid):
+    """Oyuncuyu odadan cikarir; oyun ortasindaysa akisi onarir."""
+    players = game.get('players', {})
+    if uid not in players:
+        return False
+    nick = players[uid].get('nickname', '?')
+    players.pop(uid, None)
+    game.get('eliminated', {}).pop(uid, None)
+    game.get('colorHitOrder', {}).pop(uid, None)
+    touch(game)
+    game['phaseVersion'] = game.get('phaseVersion', 0) + 1
+
+    if not players:
+        game['status'] = 'deleted'
+        return True
+
+    if game.get('host') == uid:
+        game['host'] = next(iter(players))
+        game['message'] = f"{players[game['host']]['nickname']} yeni ev sahibi"
+    else:
+        game['message'] = f'{nick} ayrıldı'
+
+    if game.get('status') != 'playing':
+        return True
+
+    alive = [u for u, p in players.items() if not p.get('eliminated') and p.get('lives', 0) > 0]
+    if len(alive) <= 1:
+        winner = alive[0] if alive else None
+        game['status'] = 'finished'
+        game['phase'] = 'result'
+        game['winner'] = winner
+        game['currentEbe'] = None
+        game['targetPlayer'] = None
+        game['selectedColor'] = None
+        game['catchDeadline'] = 0
+        game['colorDeadline'] = 0
+        game['message'] = (f'🏆 {players[winner]["nickname"]} oyunu KAZANDI!' if winner else 'Oyun bitti')
+        return True
+
+    # Ebe kactiysa yeni ebe secilir
+    if game.get('currentEbe') == uid:
+        game['currentEbe'] = random.choice(alive)
+        game['targetPlayer'] = None
+        game['selectedColor'] = None
+        game['catchDeadline'] = 0
+        game['colorDeadline'] = 0
+        game['colorHitOrder'] = {}
+        game['phase'] = 'ebe_turn'
+        for u in players:
+            players[u]['isEbe'] = (u == game['currentEbe'])
+        game['message'] = f"👑 {players[game['currentEbe']]['nickname']} yeni ebe ({nick} ayrıldı)"
+        return True
+
+    # Hedef kactiysa tur iptal edilir
+    if game.get('targetPlayer') == uid:
+        game['targetPlayer'] = None
+        if game.get('phase') in ('catching', 'istop', 'color_battle'):
+            game['phase'] = 'ebe_turn'
+            game['selectedColor'] = None
+            game['catchDeadline'] = 0
+            game['colorDeadline'] = 0
+            game['colorHitOrder'] = {}
+    return True
+
+def reap_disconnected():
+    """Uzun suredir istek atmayan (sekmeyi kapatmis) oyunculari odadan atar."""
+    now = time.time()
+    for gid, g in list(games.items()):
+        if g.get('status') == 'deleted':
+            continue
+        limit = PLAYER_TIMEOUT_PLAYING if g.get('status') == 'playing' else PLAYER_TIMEOUT_LOBBY
+        for uid, p in list(g.get('players', {}).items()):
+            last = p.get('lastSeen', g.get('createdAt', now))
+            if now - last > limit:
+                remove_player(g, uid)
+
+def reaper():
+    """5 sn'de bir baglantisi kopan oyunculari temizler."""
+    while True:
+        time.sleep(5)
+        try:
+            reap_disconnected()
+        except Exception:
+            pass
 
 def cleanup_once():
     """Bos / hareketsiz odalari siler. Kac oda silindigini dondurur."""
@@ -155,6 +243,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not player:
                     self._error('Not in game', 403)
                     return
+            else:
+                # Oyuncu hala bagli: lastSeen'i guncelle
+                player['lastSeen'] = time.time()
 
             # Oyuncunun kendi görüşü
             me = {
@@ -246,6 +337,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         'isEbe': False,
                         'eliminated': False,
                         'joinedAt': time.time(),
+                        'lastSeen': time.time(),
                     }
                 },
                 'createdAt': time.time(),
@@ -282,6 +374,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'isEbe': False,
                 'eliminated': False,
                 'joinedAt': time.time(),
+                'lastSeen': time.time(),
             }
             touch(game)
             game['phaseVersion'] += 1
@@ -297,18 +390,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not game:
                 self._send({'ok': True})  # zaten yok
                 return
-            game['players'].pop(uid, None)
-            game['eliminated'].pop(uid, None)
-            touch(game)
-            game['phaseVersion'] += 1
-            if not game['players']:
-                games[gid]['status'] = 'deleted'
-            elif game.get('host') == uid:
-                # yeni host seç
-                if game['players']:
-                    new_host = next(iter(game['players']))
-                    game['host'] = new_host
-                    game['message'] = f'{game["players"][new_host]["nickname"]} yeni ev sahibi'
+            remove_player(game, uid)
             self._send({'ok': True})
             return
 
@@ -1125,6 +1207,7 @@ if __name__ == '__main__':
     print('=' * 40)
     server = ThreadedServer(('0.0.0.0', PORT), Handler)
     threading.Thread(target=janitor, daemon=True).start()
+    threading.Thread(target=reaper, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
