@@ -147,6 +147,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'eliminated': game.get('eliminated', {}) if include_players else {},
                 'winner': game.get('winner'),
                 'status': game.get('status', 'lobby'),
+                'host': game.get('host'),
             }
 
             for puid, p in game.get('players', {}).items():
@@ -806,11 +807,8 @@ function loadPlayers(){
   api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
     if(!r.ok||!r.state)return;
     const g=r.state;if(!g||!g.players)return;
-    // host state'te dönmüyor, ama oda daha lobby'deyken
-    // state'te currentEbe yok ve phase 'waiting' ise
-    // sadece oyuncu listesini göster, başlat butonunu host'a göster
-    // isHost'u server'daki /api/rooms endpoint'inden gelen hasHost ile birleştirelim
-    // En kolay: createRoom'da isHost=true kalıcı olsun, sadece leave/logout'ta sıfırlansın
+    // State'ten host bilgisini al, ona göre isHost'u güncelle
+    isHost = (g.host === uid);
     const list=document.getElementById('player-list');
     let h='';const cnt=Object.keys(g.players).length;
     Object.keys(g.players).forEach(u=>{
@@ -835,8 +833,8 @@ function pollGame(){
     api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
       if(!r.ok||!r.state)return;
       const g=r.state;if(!g)return;
-      // isHost'i state'ten almayalım, createRoom'daki değer kalsın
-      // sadece host olmayanlar joinRoom'da false alır zaten
+      // State'ten host bilgisini oku, isHost'u güncelle
+      if(g.host){isHost = (g.host === uid);}
       stateCache=g;
       if(g.status==='deleted'){leaveRoom();return}
       if(!g.players||!g.players[uid]){leaveRoom();return}
