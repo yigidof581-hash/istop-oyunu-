@@ -117,8 +117,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             player = game.get('players', {}).get(uid)
             if not player:
-                self._error('Not in game', 403)
-                return
+                # Lobby modunda bile state verelim
+                if game.get('status') in ('lobby', 'waiting'):
+                    player = game.get('players', {}).get(list(game.get('players', {}).keys())[0]) if game.get('players') else None
+                if not player:
+                    self._error('Not in game', 403)
+                    return
 
             # Oyuncunun kendi görüşü
             me = {
@@ -129,6 +133,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'eliminated': player.get('eliminated', False),
             }
 
+            include_players = uid == game.get('host') or uid in game.get('players', {})
             state = {
                 'phase': game.get('phase', 'waiting'),
                 'phaseVersion': game.get('phaseVersion', 0),
@@ -139,7 +144,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'colorDeadline': game.get('colorDeadline', 0),
                 'message': game.get('message', ''),
                 'players': {},
-                'eliminated': game.get('eliminated', {}),
+                'eliminated': game.get('eliminated', {}) if include_players else {},
                 'winner': game.get('winner'),
                 'status': game.get('status', 'lobby'),
             }
