@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v11-soundfix'
+APP_VERSION = 'v12-reconnect'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -28,6 +28,31 @@ games = {}
 nick_uids = {}  # nickname -> uid (çakışma önleme)
 
 def new_uid(): return uuid.uuid4().hex[:12]
+
+def touch(game):
+    """Oda son hareket zamanini guncelle (bos oda temizligi icin)."""
+    if game:
+        game['updatedAt'] = time.time()
+
+def cleanup_once():
+    """Bos / hareketsiz odalari siler. Kac oda silindigini dondurur."""
+    now = time.time()
+    removed = 0
+    for gid, g in list(games.items()):
+        idle = now - g.get('updatedAt', g.get('createdAt', now))
+        if g.get('status') == 'deleted' or not g.get('players') or idle > 1800:
+            games.pop(gid, None)
+            removed += 1
+    return removed
+
+def janitor():
+    """Her 60 sn'de bir cleanup_once calistirir."""
+    while True:
+        time.sleep(60)
+        try:
+            cleanup_once()
+        except Exception:
+            pass
 
 # ============================================================
 # SUNUCU
@@ -91,7 +116,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == '/api/rooms':
             room_list = []
             for gid, g in games.items():
-                if g.get('status') != 'deleted':
+                if g.get('status') != 'deleted' and len(g.get('players', {})) > 0:
                     pc = len(g.get('players', {}))
                     room_list.append({
                         'id': gid[:8],
@@ -120,6 +145,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not game:
                 self._error('Game not found', 404)
                 return
+            touch(game)
 
             player = game.get('players', {}).get(uid)
             if not player:
@@ -223,6 +249,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     }
                 },
                 'createdAt': time.time(),
+                'updatedAt': time.time(),
             }
             self._send({'ok': True, 'gameId': gid})
             return
@@ -256,6 +283,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'eliminated': False,
                 'joinedAt': time.time(),
             }
+            touch(game)
             game['phaseVersion'] += 1
             game['message'] = f'{nick} katıldı! ({len(game["players"])}/4)'
             self._send({'ok': True})
@@ -271,6 +299,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             game['players'].pop(uid, None)
             game['eliminated'].pop(uid, None)
+            touch(game)
             game['phaseVersion'] += 1
             if not game['players']:
                 games[gid]['status'] = 'deleted'
@@ -301,6 +330,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             uids = list(game['players'].keys())
             ebe_uid = random.choice(uids)
+            touch(game)
             game['status'] = 'playing'
             game['phase'] = 'ebe_turn'
             game['currentEbe'] = ebe_uid
@@ -756,6 +786,25 @@ function api(method,path,body){
   return fetch(API+path,opts).then(r=>r.json());
 }
 
+// ========== OTURUM HAFIZASI (yenileme / kilit sonrasi geri donus) ==========
+const LS_KEY='istop_session_v1';
+let roomsTimer=null;
+function saveSession(){try{localStorage.setItem(LS_KEY,JSON.stringify({uid,nick,gameId,isHost:!!isHost}))}catch(e){}}
+function clearSession(){try{localStorage.removeItem(LS_KEY)}catch(e){}}
+function loadSession(){try{const s=JSON.parse(localStorage.getItem(LS_KEY)||'null');if(s&&s.uid&&s.nick)return s}catch(e){}return null}
+function startLobbyPoll(){
+  if(roomsTimer)clearInterval(roomsTimer);
+  pollRooms();
+  roomsTimer=setInterval(pollRooms,2000);
+}
+function stopLobbyPoll(){if(roomsTimer){clearInterval(roomsTimer);roomsTimer=null}}
+function goLobby(){
+  stopLobbyPoll();
+  gameId=null;isHost=false;
+  sc('screen-lobby');
+  startLobbyPoll();
+}
+
 // ========== OYUNCU KARTLARI ==========
 function cards(data){
   if(!data||!data.players)return;
@@ -819,7 +868,9 @@ function joinRoom(gid){
 }
 function enterRoom(){
   sc('screen-room');
+  stopLobbyPoll();
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
+  saveSession();
   loadPlayers();
   pollGame(); // oda içinde state poll
 }
@@ -977,15 +1028,18 @@ function leaveRoom(){
   Snd.stopAll();
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
-  gameId=null;isHost=false;
-  setTimeout(()=>{sc('screen-lobby')},100);
+  clearSession();
+  goLobby();
 }
 function doLogout(){
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
   Snd.stopAll();clrT();lastPhaseSig='';
-  uid=null;gameId=null;isHost=false;curPhase=null;lastVer=0;
+  stopLobbyPoll();clearSession();
+  uid=null;nick='';gameId=null;isHost=false;curPhase=null;lastVer=0;
   document.getElementById('nick-input').value='';
+  document.getElementById('nick-input').disabled=false;
+  document.getElementById('nick-btn').disabled=false;
   sc('screen-nick');
 }
 
@@ -999,8 +1053,8 @@ document.addEventListener('DOMContentLoaded',()=>{
     inp.disabled=true;document.getElementById('nick-btn').disabled=true;nick=v;
     api('POST','/api/nick',{nickname:v}).then(r=>{
       if(!r.ok){alert(r.error);inp.disabled=false;document.getElementById('nick-btn').disabled=false;return}
-      uid=r.uid;sc('screen-lobby');st('Hoş geldin, '+v+'!');
-      pollRooms();setInterval(pollRooms,2000);
+      uid=r.uid;saveSession();sc('screen-lobby');st('Hoş geldin, '+v+'!');
+      startLobbyPoll();
     }).catch(e=>{alert('Bağlantı hatası: '+e.message);inp.disabled=false;document.getElementById('nick-btn').disabled=false;});
   }
   document.getElementById('create-btn').addEventListener('click',createRoom);
@@ -1018,7 +1072,26 @@ document.addEventListener('DOMContentLoaded',()=>{
     else{curPhase=null;resultShown=false;sc('screen-room');pollGame();}
   });
   document.getElementById('result-leave-btn').addEventListener('click',leaveRoom);
-  sc('screen-nick');
+
+  // --- Oturum geri yukleme (sayfa yenileme / telefon kilidi sonrasi) ---
+  const saved=loadSession();
+  if(!saved){sc('screen-nick');return}
+  uid=saved.uid;nick=saved.nick;
+  document.getElementById('nick-input').value=nick;
+  if(!saved.gameId){st('Tekrar hoş geldin, '+nick+'!');goLobby();return}
+  gameId=saved.gameId;
+  document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
+  sc('screen-room');
+  api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since=0').then(r=>{
+    if(!r.ok||!r.state||!r.state.players||!r.state.players[uid]){
+      clearSession();goLobby();return;
+    }
+    const g=r.state;
+    lastVer=g.phaseVersion||0;
+    if(g.status==='playing'){curPhase='live';lastPhaseSig='';sc('screen-game');Snd.i();enterGame(g);pollGame();}
+    else if(g.status==='finished'){showResult(g);pollGame();}
+    else{enterRoom();}
+  }).catch(()=>{clearSession();goLobby()});
 });
 </script>
 </body>
@@ -1044,6 +1117,7 @@ if __name__ == '__main__':
     print('  (Ayni WiFi\'daki herkes girebilir)')
     print('=' * 40)
     server = ThreadedServer(('0.0.0.0', PORT), Handler)
+    threading.Thread(target=janitor, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
