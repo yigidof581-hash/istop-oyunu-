@@ -780,9 +780,14 @@ function pollRooms(){
 // ========== ODA İŞLEMLERİ ==========
 function createRoom(){
   api('POST','/api/rooms',{uid,nickname:nick}).then(r=>{
-    if(r.ok){gameId=r.gameId;isHost=true;enterRoom()}
-    else alert(r.error);
-  });
+    if(r.ok){
+      gameId=r.gameId;
+      isHost=true;
+      console.log('Oda olusturuldu, isHost=true, gameId='+gameId);
+      enterRoom();
+    }
+    else alert(r.error||'Oda olusturulamadi');
+  }).catch(e=>{alert('Baglanti hatasi');console.error(e)});
 }
 function joinRoom(gid){
   api('POST','/api/rooms/'+gid+'/join',{uid,nickname:nick}).then(r=>{
@@ -793,13 +798,19 @@ function joinRoom(gid){
 function enterRoom(){
   sc('screen-room');
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
-  pollGame(); // oda içinde de state poll
+  // Oyuncu listesini göstermek için önce state'i çek
   loadPlayers();
+  pollGame(); // oda içinde state poll
 }
 function loadPlayers(){
   api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
     if(!r.ok||!r.state)return;
     const g=r.state;if(!g||!g.players)return;
+    // host state'te dönmüyor, ama oda daha lobby'deyken
+    // state'te currentEbe yok ve phase 'waiting' ise
+    // sadece oyuncu listesini göster, başlat butonunu host'a göster
+    // isHost'u server'daki /api/rooms endpoint'inden gelen hasHost ile birleştirelim
+    // En kolay: createRoom'da isHost=true kalıcı olsun, sadece leave/logout'ta sıfırlansın
     const list=document.getElementById('player-list');
     let h='';const cnt=Object.keys(g.players).length;
     Object.keys(g.players).forEach(u=>{
@@ -808,8 +819,8 @@ function loadPlayers(){
     });
     list.innerHTML=h;
     const sb=document.getElementById('start-btn');
-    if(cnt>=2&&cnt<=4&&isHost){sb.style.display='block';sb.disabled=false;sb.textContent='🎮 Oyunu Başlat ('+cnt+'/4)';}
-    else if(isHost){sb.style.display='block';sb.disabled=true;sb.textContent='En az 2 oyuncu ('+cnt+'/4)';}
+    const showStart = isHost && cnt>=2;
+    if(showStart){sb.style.display='block';sb.disabled=cnt<2;sb.textContent=cnt>=2?'🎮 Oyunu Başlat ('+cnt+'/4)':'En az 2 oyuncu ('+cnt+'/4)';}
     else sb.style.display='none';
     st('Oyuncu: '+cnt+'/4');
     if(g.phase!=='waiting'&&g.status==='playing'){curPhase='live';enterGame(g);}
