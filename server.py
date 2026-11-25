@@ -19,7 +19,7 @@ from socketserver import ThreadingMixIn
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v15-kickghost'
+APP_VERSION = 'v16-invite'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -798,6 +798,8 @@ input{font:inherit;outline:none}
 #screen-result .sub{font-size:0.9rem;opacity:0.65}
 .hidden{display:none!important}
 .lbl{font-size:0.8rem;opacity:0.55;margin-bottom:4px}
+.btn-invite{background:#34406e;color:#fff}
+.btn-invite:active{background:#2a3358}
 </style>
 </head>
 <body>
@@ -822,8 +824,10 @@ input{font:inherit;outline:none}
 <div id="room-header">Oda</div>
 <div id="room-hint" style="font-size:0.72rem;opacity:0.65;margin:-4px 0 6px 0;text-align:center;"></div>
 <div class="player-list" id="player-list"></div>
+<button class="btn btn-invite" id="invite-btn" style="font-size:0.7rem;padding:8px 14px;">🔗 Davet linkini kopyala</button>
+<div id="invite-msg" style="display:none;font-size:0.68rem;opacity:0.7;margin-top:4px;text-align:center;"></div>
 <button class="btn btn-green" id="start-btn" style="display:none;">🎮 Oyunu Başlat</button>
-<button class="btn btn-small" id="leave-btn" style="background:#555;">Odadan Ayrıl</button>
+<button class="btn btn-small" id="leave-btn" style="background:#555;margin-top:6px;">Odadan Ayrıl</button>
 </div>
 
 <div id="screen-game" style="display:none;flex-direction:column;height:100%;width:100%;position:relative;">
@@ -846,7 +850,7 @@ input{font:inherit;outline:none}
 const BUILD='__BUILD__';
 console.log('ISTOP build',BUILD);
 let uid=null,nick='',gameId=null,isHost=false,ebem=false,eliminated=false,lastVer=0;
-let curPhase=null,timers=[],myHit=false,stateCache={},pollTimer=null;
+let curPhase=null,timers=[],myHit=false,stateCache={},pollTimer=null,pendingInvite=null;
 function clrT(){timers.forEach(t=>clearTimeout(t));timers=[]}
 function sc(id){['screen-nick','screen-lobby','screen-room','screen-game','screen-result'].forEach(s=>{const e=document.getElementById(s);if(e)e.style.display=s===id?'flex':'none'})}
 function msg(t){const e=document.getElementById('msg');if(e)e.textContent=t}
@@ -951,6 +955,18 @@ function joinRoom(gid){
     else alert(r.error);
   });
 }
+// Davet linki ile otomatik katilim
+function joinViaInvite(){
+  if(!pendingInvite||!uid)return;
+  const gid=pendingInvite;pendingInvite=null;
+  const doJoin=()=>api('POST','/api/rooms/'+gid+'/join',{uid,nickname:nick}).then(r=>{
+    if(r.ok){gameId=gid;isHost=false;enterRoom()}
+    else alert(r.error||'Odaya katılınamadı');
+  }).catch(()=>alert('Bağlantı hatası'));
+  if(gameId){
+    api('POST','/api/rooms/'+gameId+'/leave',{uid}).then(doJoin).catch(doJoin);
+  }else doJoin();
+}
 function enterRoom(){
   sc('screen-room');
   stopLobbyPoll();
@@ -958,6 +974,20 @@ function enterRoom(){
   saveSession();
   loadPlayers();
   pollGame(); // oda içinde state poll
+}
+
+// ========== DAVET LINKI ==========
+function inviteLink(){return API+'/#oda='+gameId}
+function copyInvite(){
+  if(!gameId)return;
+  const link=inviteLink();
+  const done=()=>{const m=document.getElementById('invite-msg');if(m){m.style.display='block';m.textContent='Link kopyalandı! Yapıştırıp arkadaşına gönder ✔'}};
+  try{
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(link).then(done).catch(fallback)}else fallback();
+  }catch(e){fallback()}
+  function fallback(){
+    try{const ta=document.createElement('textarea');ta.value=link;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()}catch(e){prompt('Linki kopyala:',link)}
+  }
 }
 // Lobide ekrani state'ten ciz (her poll'da cagrilir)
 function renderRoom(g){
@@ -1140,6 +1170,7 @@ document.addEventListener('DOMContentLoaded',()=>{
       if(!r.ok){alert(r.error);inp.disabled=false;document.getElementById('nick-btn').disabled=false;return}
       uid=r.uid;saveSession();sc('screen-lobby');st('Hoş geldin, '+v+'!');
       startLobbyPoll();
+      if(pendingInvite)joinViaInvite();
     }).catch(e=>{alert('Bağlantı hatası: '+e.message);inp.disabled=false;document.getElementById('nick-btn').disabled=false;});
   }
   document.getElementById('create-btn').addEventListener('click',createRoom);
@@ -1151,6 +1182,7 @@ document.addEventListener('DOMContentLoaded',()=>{
     }).catch(e=>{alert('Baglanti hatasi');console.warn(e)});
   });
   document.getElementById('leave-btn').addEventListener('click',leaveRoom);
+  document.getElementById('invite-btn').addEventListener('click',copyInvite);
   document.getElementById('game-exit-btn').addEventListener('click',()=>{
     if(!gameId)return;
     if(confirm('Oyundan ayrılmak istediğine emin misin? Lobiye döneceksin.'))leaveRoom();
@@ -1162,12 +1194,19 @@ document.addEventListener('DOMContentLoaded',()=>{
   });
   document.getElementById('result-leave-btn').addEventListener('click',leaveRoom);
 
+  // --- Davet linki (#oda=XXX) algila ---
+  try{
+    const h=(window.location.hash||'').replace(/^#/,'');
+    if(h.startsWith('oda=')&&h.length>4)pendingInvite=h.slice(4);
+  }catch(e){}
+
   // --- Oturum geri yukleme (sayfa yenileme / telefon kilidi sonrasi) ---
   const saved=loadSession();
   if(!saved){sc('screen-nick');return}
   uid=saved.uid;nick=saved.nick;
   document.getElementById('nick-input').value=nick;
-  if(!saved.gameId){st('Tekrar hoş geldin, '+nick+'!');goLobby();return}
+  if(!saved.gameId){st('Tekrar hoş geldin, '+nick+'!');goLobby();if(pendingInvite)joinViaInvite();return}
+  if(pendingInvite&&pendingInvite!==saved.gameId){goLobby();joinViaInvite();return}
   gameId=saved.gameId;
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
   sc('screen-room');
