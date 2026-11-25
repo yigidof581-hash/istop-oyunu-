@@ -808,7 +808,7 @@ function loadPlayers(){
     });
     list.innerHTML=h;
     const sb=document.getElementById('start-btn');
-    if(isHost&&cnt>=2&&cnt<=4){sb.style.display='block';sb.disabled=false;sb.textContent='🎮 Oyunu Başlat ('+cnt+'/4)';}
+    if(cnt>=2&&cnt<=4&&isHost){sb.style.display='block';sb.disabled=false;sb.textContent='🎮 Oyunu Başlat ('+cnt+'/4)';}
     else if(isHost){sb.style.display='block';sb.disabled=true;sb.textContent='En az 2 oyuncu ('+cnt+'/4)';}
     else sb.style.display='none';
     st('Oyuncu: '+cnt+'/4');
@@ -824,6 +824,8 @@ function pollGame(){
     api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
       if(!r.ok||!r.state)return;
       const g=r.state;if(!g)return;
+      // isHost'i state'ten almayalım, createRoom'daki değer kalsın
+      // sadece host olmayanlar joinRoom'da false alır zaten
       stateCache=g;
       if(g.status==='deleted'){leaveRoom();return}
       if(!g.players||!g.players[uid]){leaveRoom();return}
