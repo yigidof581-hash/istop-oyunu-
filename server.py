@@ -21,7 +21,7 @@ import asyncio
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v20-ws'
+APP_VERSION = 'v22-stats'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
