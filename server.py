@@ -608,7 +608,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'eliminated': {},
                 'winner': None,
                 'colorHitOrder': {},
-                'readyPlayers': {},
+                'readyPlayers': {uid: True},
                 'boardTheme': 'felt',
                 'players': {
                     uid: {
@@ -750,7 +750,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._error('En az 2 oyuncu gerekli')
                 return
             ready = game.get('readyPlayers', {})
-            not_ready = [u for u in game['players'] if not ready.get(u)]
+            not_ready = [u for u in game['players'] if u != game.get('host') and not ready.get(u)]
             if not_ready:
                 names = ', '.join(game['players'][u]['nickname'] for u in not_ready)
                 self._error(f'Hazır olmayan oyuncular: {names}')
