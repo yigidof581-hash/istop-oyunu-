@@ -30,6 +30,8 @@ games = {}
 nick_uids = {}  # nickname -> uid (çakışma önleme)
 bots = {}       # game_id -> set of bot uids
 stats = {}      # uid -> {'wins':0,'games':0,'nick':''}
+notifications = {}  # uid -> list of {text, time, type}
+MAX_NOTIFICATIONS = 50
 
 # ============================================================
 # WEBSOCKET + KEEP-ALIVE
@@ -260,6 +262,19 @@ def bot_loop():
 
 def new_uid(): return uuid.uuid4().hex[:12]
 
+def add_notification(uid, text, ntype='info'):
+    if not uid:
+        return
+    arr = notifications.setdefault(uid, [])
+    arr.append({
+        'text': text,
+        'time': time.time(),
+        'type': ntype,
+        'read': False,
+    })
+    if len(arr) > MAX_NOTIFICATIONS:
+        del arr[:-MAX_NOTIFICATIONS]
+
 def touch(game):
     """Oda son hareket zamanini guncelle (bos oda temizligi icin)."""
     if game:
@@ -447,9 +462,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             target = params.get('uid', [None])[0]
             data = {}
             if target:
-                data[target] = stats.get(target, {'wins': 0, 'games': 0, 'nick': ''})
+                data[target] = {
+                    'wins': stats.get(target, {}).get('wins', 0),
+                    'games': stats.get(target, {}).get('games', 0),
+                    'nick': stats.get(target, {}).get('nick', ''),
+                    'notifications': notifications.get(target, [])[-20:],
+                }
             else:
-                data = {u: {'wins': s.get('wins', 0), 'games': s.get('games', 0), 'nick': s.get('nick', '')} for u, s in stats.items()}
+                data = {u: {'wins': s.get('wins', 0), 'games': s.get('games', 0), 'nick': s.get('nick', ''), 'notifications': notifications.get(u, [])[-20:]} for u, s in stats.items()}
             self._send({'ok': True, 'stats': data})
             return
 
@@ -536,6 +556,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             state['colorHitOrder'] = dict(game.get('colorHitOrder', {}))
             state['readyPlayers'] = dict(game.get('readyPlayers', {}))
+            state['notifications'] = notifications.get(uid, [])[-20:]
             self._send({'ok': True, 'state': state, 'me': me, 'version': game.get('phaseVersion', 0)})
             return
 
@@ -636,6 +657,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             touch(game)
             game['phaseVersion'] += 1
             game['message'] = f'{nick} katıldı! ({len(game["players"])}/4)'
+            for u in game['players']:
+                add_notification(u, f'{nick} odaya katıldı', 'join')
             self._send({'ok': True})
             broadcast_state(gid)
             return
@@ -674,6 +697,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['message'] = f'{player["nickname"]} {"hazır" if ready else "hazır değil"}'
             game['phaseVersion'] += 1
             self._send({'ok': True, 'ready': ready})
+            for u in game['players']:
+                add_notification(u, f'{player["nickname"]} {"hazır" if ready else "hazır değil"}', 'ready')
             broadcast_state(gid)
             return
 
@@ -747,6 +772,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 game['players'][u]['eliminated'] = False
             game['message'] = f'👑 {game["players"][ebe_uid]["nickname"]} ebe oldu!'
             game['phaseVersion'] += 1
+            for u in game['players']:
+                add_notification(u, f'👑 {game["players"][ebe_uid]["nickname"]} ebe oldu', 'ebe')
             self._send({'ok': True})
             broadcast_state(gid)
             return
@@ -855,6 +882,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             renk_adi = 'YEŞİL' if color == 'green' else 'KIRMIZI'
             game['message'] = f'🔍 {renk_adi} rengine dokun!'
             game['phaseVersion'] += 1
+            for u in game['players']:
+                add_notification(u, f'Renk savaşı: {renk_adi}', 'battle')
             broadcast_state(gid)
 
             t = threading.Timer(5.5, check_color_timeout, args=[gid])
@@ -992,8 +1021,12 @@ def resolve_color_battle(gid):
         pls[loser]['eliminated'] = True
         elim[loser] = True
         game['message'] = f'☠️ {nick_loser} elendi!'
+        for u in pls:
+            add_notification(u, f'☠️ {nick_loser} elendi!', 'eliminate')
     else:
         game['message'] = f'💔 {nick_loser} vuruldu! ({"❤️" * new_lives})'
+        for u in pls:
+            add_notification(u, f'💔 {nick_loser} vuruldu', 'hit')
 
     # Kalan canlı oyuncu sayısı (ebe hariç)
     remaining = [u for u in alive if u != loser and not elim.get(u)]
@@ -1014,6 +1047,7 @@ def resolve_color_battle(gid):
                 s['nick'] = p.get('nickname', s.get('nick', '?'))
                 if u == winner:
                     s['wins'] += 1
+                add_notification(u, f'🏆 {pls[winner]["nickname"]} oyunu KAZANDI!', 'win')
             broadcast_state(gid)
             return
 
@@ -1194,6 +1228,7 @@ input{font:inherit;outline:none}
 <div id="screen-stats" class="screen">
 <div class="lbl" style="margin-top:-8px;">── İSTATİSTİK ──</div>
 <div id="stats-list" style="width:100%;max-width:360px;max-height:70vh;overflow-y:auto;"></div>
+<div id="notif-list" style="width:100%;max-width:360px;max-height:30vh;overflow-y:auto;margin-top:8px;"></div>
 <button class="btn btn-gold" id="stats-close-btn" style="width:80%;max-width:240px;">Kapat</button>
 </div>
 
@@ -1562,9 +1597,11 @@ function openStats(){
   sc('screen-stats');
   api('GET','/api/stats?uid='+uid).then(r=>{
     if(!r.ok||!r.stats)return;
-    const data=r.stats[uid]||{wins:0,games:0,nick:''};
+    const data=r.stats[uid]||{wins:0,games:0,nick:'',notifications:[]};
     const winRate=data.games?Math.round(data.wins/data.games*100):0;
     document.getElementById('stats-list').innerHTML=`<div class="pl-item"><span class="pln">Toplam Oyun</span><span>${data.games}</span></div><div class="pl-item"><span class="pln">Kazanma</span><span>${data.wins}</span></div><div class="pl-item"><span class="pln">Kazanma Oranı</span><span>%${winRate}</span></div>`;
+    const notifs=(data.notifications||[]).slice().reverse();
+    document.getElementById('notif-list').innerHTML=notifs.length?'<div class="lbl">Bildirimler</div>'+notifs.map(n=>`<div class="pl-item"><span class="pln">${esc(n.text)}</span><span style="opacity:0.6;font-size:0.7rem;">${new Date(n.time*1000).toLocaleTimeString()}</span></div>`).join(''):'<div style="opacity:0.5;text-align:center;padding:10px;">Henüz bildirim yok</div>';
   }).catch(()=>{});
 }
 function closeStats(){
