@@ -15,17 +15,135 @@ import os
 import html as html_mod
 from urllib.parse import urlparse, parse_qs
 from socketserver import ThreadingMixIn
+import websockets
+import asyncio
 
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v19-exitfix'
+APP_VERSION = 'v20-ws'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
 # ============================================================
 games = {}
 nick_uids = {}  # nickname -> uid (çakışma önleme)
+
+# ============================================================
+# WEBSOCKET + KEEP-ALIVE
+# ============================================================
+WS_PORT_OFFSET = 1  # WS sunucu HTTP portu + 1’de çalışır
+ws_clients = {}     # game_id -> set of websocket
+ws_meta = {}        # websocket -> {'gameId':..,'uid':..}
+ws_lock = threading.Lock()
+ws_loop = None      # WS sunucunun event loop referansı
+
+def build_public_state(game, uid):
+    player = game.get('players', {}).get(uid)
+    if not player:
+        if game.get('status') in ('lobby', 'waiting'):
+            players = game.get('players', {})
+            player = next(iter(players.values())) if players else None
+        if not player:
+            return None
+    me = {
+        'uid': uid,
+        'nickname': player.get('nickname', '?'),
+        'lives': player.get('lives', 0),
+        'isEbe': player.get('isEbe', False),
+        'eliminated': player.get('eliminated', False),
+    }
+    include_players = uid == game.get('host') or uid in game.get('players', {})
+    state = {
+        'phase': game.get('phase', 'waiting'),
+        'phaseVersion': game.get('phaseVersion', 0),
+        'currentEbe': game.get('currentEbe'),
+        'targetPlayer': game.get('targetPlayer'),
+        'selectedColor': game.get('selectedColor'),
+        'catchDeadline': game.get('catchDeadline', 0),
+        'colorDeadline': game.get('colorDeadline', 0),
+        'message': game.get('message', ''),
+        'players': {},
+        'eliminated': game.get('eliminated', {}) if include_players else {},
+        'winner': game.get('winner'),
+        'status': game.get('status', 'lobby'),
+        'host': game.get('host'),
+    }
+    for puid, p in game.get('players', {}).items():
+        state['players'][puid] = {
+            'nickname': p.get('nickname', '?'),
+            'lives': p.get('lives', 0),
+            'isEbe': p.get('isEbe', False),
+        }
+    state['colorHitOrder'] = dict(game.get('colorHitOrder', {}))
+    return {'ok': True, 'state': state, 'me': me, 'version': game.get('phaseVersion', 0)}
+
+def broadcast_state(game_id):
+    game = games.get(game_id)
+    if not game:
+        return
+    with ws_lock:
+        clients = list(ws_clients.get(game_id, set()))
+    for ws in clients:
+        meta = ws_meta.get(ws)
+        if not meta:
+            continue
+        result = build_public_state(game, meta['uid'])
+        if not result:
+            continue
+        msg = json.dumps({'type': 'state', 'data': result})
+        if ws_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send(msg), ws_loop)
+            except Exception:
+                pass
+
+async def ws_handler(websocket, path):
+    global ws_loop
+    ws_loop = asyncio.get_event_loop()
+    try:
+        async for raw in websocket:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if msg.get('type') == 'subscribe':
+                gid = msg.get('gameId')
+                uid = msg.get('uid')
+                if gid and uid:
+                    with ws_lock:
+                        ws_clients.setdefault(gid, set()).add(websocket)
+                        ws_meta[websocket] = {'gameId': gid, 'uid': uid}
+                    # Hemen mevcut state’i yolla
+                    game = games.get(gid)
+                    if game:
+                        result = build_public_state(game, uid)
+                        if result:
+                            await websocket.send(json.dumps({'type': 'state', 'data': result}))
+            elif msg.get('type') == 'unsubscribe':
+                with ws_lock:
+                    for gid in list(ws_clients.keys()):
+                        ws_clients[gid].discard(websocket)
+                    ws_meta.pop(websocket, None)
+            elif msg.get('type') == 'ping':
+                try:
+                    await websocket.send(json.dumps({'type': 'pong'}))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        with ws_lock:
+            for gid in list(ws_clients.keys()):
+                ws_clients[gid].discard(websocket)
+            ws_meta.pop(websocket, None)
+
+def start_ws_server():
+    port = PORT + WS_PORT_OFFSET
+    async def main():
+        async with websockets.serve(ws_handler, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
+            await asyncio.Future()
+    asyncio.run(main())
 
 def new_uid(): return uuid.uuid4().hex[:12]
 
@@ -198,6 +316,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Surum bilgisi (deploy dogrulamasi)
         if path == '/api/version':
             self._send({'ok': True, 'version': APP_VERSION})
+            return
+
+        # Keep-alive ping
+        if path == '/api/ping':
+            self._send({'ok': True, 'pong': True, 'time': time.time()})
             return
 
         # Oda listesi
@@ -380,6 +503,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['phaseVersion'] += 1
             game['message'] = f'{nick} katıldı! ({len(game["players"])}/4)'
             self._send({'ok': True})
+            broadcast_state(gid)
             return
 
         # --- ODA AYRIL ---
@@ -392,6 +516,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             remove_player(game, uid)
             self._send({'ok': True})
+            broadcast_state(gid)
             return
 
         # --- OYUN BAŞLAT ---
@@ -430,6 +555,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['message'] = f'👑 {game["players"][ebe_uid]["nickname"]} ebe oldu!'
             game['phaseVersion'] += 1
             self._send({'ok': True})
+            broadcast_state(gid)
             return
 
         # --- TOP FIRLAT ---
@@ -457,6 +583,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['catchDeadline'] = time.time() * 1000 + 4000
             game['message'] = f'⚡ {game["players"][target]["nickname"]} yakalamaya çalışıyor!'
             game['phaseVersion'] += 1
+            broadcast_state(gid)
 
             # 4 sn sonra timeout kontrol
             t = threading.Timer(4.5, check_catch_timeout, args=[gid])
@@ -502,6 +629,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['message'] = f'🎯 {game["players"][uid]["nickname"]} topu yakaladı! Yeni ebe!'
             game['phaseVersion'] += 1
             self._send({'ok': True})
+            broadcast_state(gid)
             return
 
         # --- İSTOP RENK SEÇ ---
@@ -534,6 +662,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             renk_adi = 'YEŞİL' if color == 'green' else 'KIRMIZI'
             game['message'] = f'🔍 {renk_adi} rengine dokun!'
             game['phaseVersion'] += 1
+            broadcast_state(gid)
 
             t = threading.Timer(5.5, check_color_timeout, args=[gid])
             t.daemon = True
@@ -568,6 +697,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             game['colorHitOrder'][uid] = time.time() * 1000
             self._send({'ok': True, 'order': len(game['colorHitOrder'])})
+            broadcast_state(gid)
             return
 
         # --- TEKRAR ---
@@ -598,6 +728,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['colorHitOrder'] = {}
             game['message'] = 'Tekrar oyunu!'
             game['phaseVersion'] += 1
+            broadcast_state(gid)
             for u in game['players']:
                 game['players'][u]['lives'] = 3
                 game['players'][u]['isEbe'] = False
@@ -620,6 +751,7 @@ def check_catch_timeout(gid):
         game['catchDeadline'] = 0
         game['message'] = '💥 Top kaçtı! İstop!'
         game['phaseVersion'] += 1
+        broadcast_state(gid)
 
 def check_color_timeout(gid):
     game = games.get(gid)
@@ -638,7 +770,7 @@ def resolve_color_battle(gid):
 
     alive = [u for u in pls if u != ebe_id and not elim.get(u) and pls[u].get('lives', 0) > 0]
     if not alive:
-        reset_after_battle(game)
+        reset_after_battle(game, gid)
         return
 
     touched = list(hits.keys())
@@ -656,7 +788,7 @@ def resolve_color_battle(gid):
         loser = random.choice(alive)
 
     if loser is None:
-        reset_after_battle(game)
+        reset_after_battle(game, gid)
         return
 
     new_lives = max(0, pls[loser].get('lives', 1) - 1)
@@ -683,6 +815,7 @@ def resolve_color_battle(gid):
             game['winner'] = winner
             game['message'] = f'🏆 {pls[winner]["nickname"]} oyunu KAZANDI!'
             game['phaseVersion'] += 1
+            broadcast_state(gid)
             return
 
     # Yeni ebe seç
@@ -705,8 +838,9 @@ def resolve_color_battle(gid):
     if new_ebe in pls:
         game['message'] = f'👑 {pls[new_ebe]["nickname"]} yeni ebe!'
     game['phaseVersion'] += 1
+    broadcast_state(gid)
 
-def reset_after_battle(game):
+def reset_after_battle(game, gid):
     candidates = [u for u in game['players'] if not game['players'][u].get('eliminated') and game['players'][u].get('lives', 0) > 0]
     if not candidates:
         candidates = list(game['players'].keys())
@@ -722,6 +856,7 @@ def reset_after_battle(game):
         game['players'][u]['isEbe'] = (u == ne)
     game['message'] = f'👑 {game["players"][ne]["nickname"]} yeni ebe!'
     game['phaseVersion'] += 1
+    broadcast_state(gid)
 
 
 # ============================================================
@@ -983,6 +1118,7 @@ function enterRoom(){
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
   saveSession();
   loadPlayers();
+  connectWs(); // WS dene
   pollGame(); // oda içinde state poll
 }
 
@@ -1035,33 +1171,71 @@ function loadPlayers(){
 }
 
 // ========== OYUN POLL ==========
+function applyGameState(g){
+  if(!g)return;
+  if(g.host){isHost = (g.host === uid);}
+  stateCache=g;
+  if(g.status==='deleted'){leaveRoom();return}
+  if(!g.players||!g.players[uid]){leaveRoom();return}
+  if(g.phaseVersion>lastVer){lastVer=g.phaseVersion;clrT();myHit=false;}
+  const pl=g.players||{},prev=prevLives;
+  let lost=false;
+  Object.keys(pl).forEach(u=>{const nl=pl[u]&&pl[u].lives||0;if(!prev.hasOwnProperty(u)){prev[u]=nl} else if(nl<prev[u]){lost=true;prev[u]=nl}});
+  if(lost)flashRed();
+  cards(g);
+  if(g.status==='playing'&&!curPhase){curPhase='live';sc('screen-game');Snd.i();enterGame(g);}
+  else if(g.status==='playing'&&curPhase){gameTick(g);}
+  else if(g.status==='finished'){showResult(g);}
+  else if(g.status==='lobby'){curPhase=null;renderRoom(g);}
+  if(g.message)msg(g.message);
+}
 function pollGame(){
   if(pollTimer)clearInterval(pollTimer);
   pollTimer=setInterval(()=>{
     if(!gameId||!uid)return;
     api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since='+lastVer).then(r=>{
       if(!r.ok||!r.state)return;
-      const g=r.state;if(!g)return;
-      // State'ten host bilgisini oku, isHost'u güncelle
-      if(g.host){isHost = (g.host === uid);}
-      stateCache=g;
-      if(g.status==='deleted'){leaveRoom();return}
-      if(!g.players||!g.players[uid]){leaveRoom();return}
-      if(g.phaseVersion>lastVer){lastVer=g.phaseVersion;clrT();myHit=false;}
-      // Can kaybi / elenme tespiti -> kirmizi flas
-      const pl=g.players||{},prev=prevLives;
-      let lost=false;
-      Object.keys(pl).forEach(u=>{const nl=pl[u]&&pl[u].lives||0;if(!prev.hasOwnProperty(u)){prev[u]=nl} else if(nl<prev[u]){lost=true;prev[u]=nl}});
-      if(lost)flashRed();
-      cards(g);
-      if(g.status==='playing'&&!curPhase){curPhase='live';sc('screen-game');Snd.i();enterGame(g);}
-      else if(g.status==='playing'&&curPhase){gameTick(g);}
-      else if(g.status==='finished'){showResult(g);}
-      else if(g.status==='lobby'){curPhase=null;renderRoom(g);}
-      if(g.message)msg(g.message);
+      applyGameState(r.state);
     }).catch(e=>{console.warn('poll err',e)});
   },250);
 }
+
+// ========== WEBSOCKET ==========
+let ws=null,wsMode=false;
+const WS_PORT_OFFSET=1;
+function getWsUrl(){
+  const loc=window.location;
+  const host=loc.hostname;
+  const port=parseInt(loc.port||(loc.protocol==='https:'?'443':'80'));
+  const wsPort=port+WS_PORT_OFFSET;
+  const proto=loc.protocol==='https:'?'wss':'ws';
+  return `${proto}://${host}:${wsPort}/`;
+}
+function connectWs(){
+  if(wsMode)return;
+  const url=getWsUrl();
+  try{
+    ws=new WebSocket(url);
+    const timer=setTimeout(()=>{if(ws&&ws.readyState!==WebSocket.OPEN){ws.close();ws=null;}},2000);
+    ws.onopen=()=>{
+      clearTimeout(timer);
+      wsMode=true;
+      console.log('WS baglandi');
+      if(pollTimer){clearInterval(pollTimer);pollTimer=null}
+      stopLobbyPoll();
+      if(gameId&&uid)ws.send(JSON.stringify({type:'subscribe',gameId:gameId,uid:uid}));
+    };
+    ws.onmessage=(e)=>{
+      try{
+        const msg=JSON.parse(e.data);
+        if(msg.type==='state'&&msg.data&&msg.data.state)applyGameState(msg.data.state);
+      }catch(err){}
+    };
+    ws.onclose=()=>{ws=null;wsMode=false;if(gameId)pollGame();else startLobbyPoll();};
+    ws.onerror=()=>{if(ws)ws.close();};
+  }catch(e){}
+}
+function disconnectWs(){if(ws){try{ws.close();}catch(e){}ws=null;}wsMode=false;}
 
 let lastPhaseSig='';
 function enterGame(g){prevLives={};cards(g);gameTick(g);}
@@ -1182,6 +1356,7 @@ let resultShown=false;
 function leaveRoom(){
   clrT();curPhase=null;lastVer=0;ebem=false;eliminated=false;myHit=false;resultShown=false;lastPhaseSig='';
   Snd.stopAll();
+  disconnectWs();
   if(pollTimer){clearInterval(pollTimer);pollTimer=null}
   if(gameId&&uid)api('POST','/api/rooms/'+gameId+'/leave',{uid}).catch(()=>{});
   clearSession();
@@ -1252,6 +1427,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   gameId=saved.gameId;
   document.getElementById('room-header').textContent='Oda #'+gameId.substring(0,8);
   sc('screen-room');
+  connectWs();
   api('GET','/api/game/'+gameId+'/state?uid='+uid+'&since=0').then(r=>{
     if(!r.ok||!r.state||!r.state.players||!r.state.players[uid]){
       clearSession();goLobby();return;
@@ -1289,6 +1465,7 @@ if __name__ == '__main__':
     server = ThreadedServer(('0.0.0.0', PORT), Handler)
     threading.Thread(target=janitor, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
+    threading.Thread(target=start_ws_server, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

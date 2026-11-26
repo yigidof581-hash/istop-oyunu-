@@ -1,1 +1,1 @@
-# Python standart kütüphanesi - ek bağımlılık gerekmez
+websockets>=12.0
