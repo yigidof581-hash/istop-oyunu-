@@ -28,6 +28,7 @@ APP_VERSION = 'v20-ws'
 # ============================================================
 games = {}
 nick_uids = {}  # nickname -> uid (çakışma önleme)
+bots = {}       # game_id -> set of bot uids
 
 # ============================================================
 # WEBSOCKET + KEEP-ALIVE
@@ -144,6 +145,117 @@ def start_ws_server():
         async with websockets.serve(ws_handler, "0.0.0.0", port, ping_interval=20, ping_timeout=20):
             await asyncio.Future()
     asyncio.run(main())
+
+# ============================================================
+# BOT SİSTEMİ
+# ============================================================
+BOT_NAMES = ['Bot Ali','Bot Zeynep','Bot Mert','Bot Elif','Bot Can','Bot Ada']
+
+def bot_add(game, host_uid):
+    game_id = id(game)
+    if game_id not in bots:
+        bots[game_id] = set()
+    existing = bots[game_id]
+    if len(existing) >= 2:
+        return None, 'En fazla 2 bot eklenebilir'
+    used = set(BOT_NAMES) - {game['players'][u]['nickname'] for u in game['players']}
+    if not used:
+        return None, 'Bot adı kalmadı'
+    name = sorted(used)[0]
+    buid = new_uid()
+    game['players'][buid] = {
+        'nickname': name,
+        'lives': 3,
+        'isEbe': False,
+        'eliminated': False,
+        'joinedAt': time.time(),
+        'lastSeen': time.time(),
+    }
+    game.setdefault('readyPlayers', {})[buid] = True
+    bots[game_id].add(buid)
+    touch(game)
+    game['phaseVersion'] += 1
+    game['message'] = f'🤖 {name} katıldı!'
+    return buid, None
+
+def bot_remove(game, buid):
+    game_id = id(game)
+    if game_id in bots:
+        bots[game_id].discard(buid)
+    remove_player(game, buid)
+
+def bot_tick():
+    now = time.time()
+    for gid, game in list(games.items()):
+        if game.get('status') != 'playing':
+            continue
+        gid_bots = bots.get(id(game), set())
+        if not gid_bots:
+            continue
+        phase = game.get('phase')
+        ebe = game.get('currentEbe')
+        pls = game.get('players', {})
+        elim = game.get('eliminated', {})
+        for buid in list(gid_bots):
+            if buid not in pls:
+                continue
+            if pls[buid].get('eliminated') or pls[buid].get('lives', 0) <= 0:
+                continue
+            if phase == 'ebe_turn' and buid == ebe:
+                alive = [u for u in pls if u != buid and not elim.get(u) and pls[u].get('lives', 0) > 0]
+                if alive:
+                    target = random.choice(alive)
+                    game['phase'] = 'catching'
+                    game['targetPlayer'] = target
+                    game['catchDeadline'] = time.time() * 1000 + 6000
+                    game['message'] = f'⚡ {pls[target]["nickname"]} yakalamaya çalışıyor!'
+                    game['phaseVersion'] += 1
+                    broadcast_state(gid)
+                    t = threading.Timer(6.5, check_catch_timeout, args=[gid])
+                    t.daemon = True
+                    t.start()
+            elif phase == 'catching' and buid == game.get('targetPlayer'):
+                if game['players'][buid].get('eliminated'):
+                    continue
+                if time.time() * 1000 > game.get('catchDeadline', 0):
+                    continue
+                game['phase'] = 'ebe_turn'
+                game['currentEbe'] = buid
+                game['targetPlayer'] = None
+                game['catchDeadline'] = 0
+                for u in pls:
+                    pls[u]['isEbe'] = (u == buid)
+                game['message'] = f'🎯 {pls[buid]["nickname"]} topu yakaladı! Yeni ebe!'
+                game['phaseVersion'] += 1
+                broadcast_state(gid)
+            elif phase == 'istop' and buid == ebe:
+                color = random.choice(['green', 'red'])
+                game['phase'] = 'color_battle'
+                game['selectedColor'] = color
+                game['colorDeadline'] = time.time() * 1000 + 5000
+                game['colorHitOrder'] = {}
+                renk_adi = 'YEŞİL' if color == 'green' else 'KIRMIZI'
+                game['message'] = f'🔍 {renk_adi} rengine dokun!'
+                game['phaseVersion'] += 1
+                broadcast_state(gid)
+                t = threading.Timer(5.5, check_color_timeout, args=[gid])
+                t.daemon = True
+                t.start()
+            elif phase == 'color_battle' and buid != ebe:
+                if game['players'][buid].get('eliminated'):
+                    continue
+                if buid in game.get('colorHitOrder', {}):
+                    continue
+                game['colorHitOrder'][buid] = time.time() * 1000
+                broadcast_state(gid)
+
+def bot_loop():
+    while True:
+        time.sleep(0.5)
+        try:
+            bot_tick()
+        except Exception:
+            pass
 
 def new_uid(): return uuid.uuid4().hex[:12]
 
@@ -401,9 +513,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     'nickname': p.get('nickname', '?'),
                     'lives': p.get('lives', 0),
                     'isEbe': p.get('isEbe', False),
+                    'isBot': puid in bots.get(id(game), set()),
                 }
 
             state['colorHitOrder'] = dict(game.get('colorHitOrder', {}))
+            state['readyPlayers'] = dict(game.get('readyPlayers', {}))
             self._send({'ok': True, 'state': state, 'me': me, 'version': game.get('phaseVersion', 0)})
             return
 
@@ -453,6 +567,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'eliminated': {},
                 'winner': None,
                 'colorHitOrder': {},
+                'readyPlayers': {},
                 'players': {
                     uid: {
                         'nickname': nick,
@@ -499,6 +614,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'joinedAt': time.time(),
                 'lastSeen': time.time(),
             }
+            game['readyPlayers'][uid] = False
             touch(game)
             game['phaseVersion'] += 1
             game['message'] = f'{nick} katıldı! ({len(game["players"])}/4)'
@@ -514,8 +630,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not game:
                 self._send({'ok': True})  # zaten yok
                 return
+            game.get('readyPlayers', {}).pop(uid, None)
             remove_player(game, uid)
             self._send({'ok': True})
+            broadcast_state(gid)
+            return
+
+        # --- READY TOGGLE ---
+        if path.startswith('/api/rooms/') and path.endswith('/ready'):
+            gid = path.split('/')[3]
+            uid = body.get('uid', '')
+            ready = bool(body.get('ready'))
+            game = games.get(gid)
+            if not game:
+                self._error('Oda bulunamadı')
+                return
+            if game.get('status') != 'lobby':
+                self._error('Sadece lobide hazır olunabilir')
+                return
+            player = game.get('players', {}).get(uid)
+            if not player:
+                self._error('Oyunda değilsin')
+                return
+            game.setdefault('readyPlayers', {})[uid] = ready
+            game['message'] = f'{player["nickname"]} {"hazır" if ready else "hazır değil"}'
+            game['phaseVersion'] += 1
+            self._send({'ok': True, 'ready': ready})
+            broadcast_state(gid)
+            return
+
+        # --- BOT EKLE / CIKAR ---
+        if path.startswith('/api/rooms/') and path.endswith('/bots'):
+            gid = path.split('/')[3]
+            uid = body.get('uid', '')
+            action = body.get('action', 'add')
+            game = games.get(gid)
+            if not game:
+                self._error('Oda bulunamadı')
+                return
+            if game.get('host') != uid:
+                self._error('Sadece ev sahibi bot ekleyebilir')
+                return
+            if action == 'add':
+                buid, err = bot_add(game, uid)
+                if err:
+                    self._error(err)
+                    return
+                self._send({'ok': True, 'botUid': buid})
+            else:
+                # remove first bot
+                gid_bots = bots.get(id(game), set())
+                if not gid_bots:
+                    self._error('Bot yok')
+                    return
+                bot_remove(game, next(iter(gid_bots)))
+                self._send({'ok': True})
             broadcast_state(gid)
             return
 
@@ -533,6 +702,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pcount = len(game['players'])
             if pcount < 2:
                 self._error('En az 2 oyuncu gerekli')
+                return
+            ready = game.get('readyPlayers', {})
+            not_ready = [u for u in game['players'] if not ready.get(u)]
+            if not_ready:
+                names = ', '.join(game['players'][u]['nickname'] for u in not_ready)
+                self._error(f'Hazır olmayan oyuncular: {names}')
                 return
 
             uids = list(game['players'].keys())
@@ -580,13 +755,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             game['phase'] = 'catching'
             game['targetPlayer'] = target
-            game['catchDeadline'] = time.time() * 1000 + 4000
+            game['catchDeadline'] = time.time() * 1000 + 6000
             game['message'] = f'⚡ {game["players"][target]["nickname"]} yakalamaya çalışıyor!'
             game['phaseVersion'] += 1
             broadcast_state(gid)
 
-            # 4 sn sonra timeout kontrol
-            t = threading.Timer(4.5, check_catch_timeout, args=[gid])
+            # 6 sn sonra timeout kontrol
+            t = threading.Timer(6.5, check_catch_timeout, args=[gid])
             t.daemon = True
             t.start()
             self._send({'ok': True})
@@ -972,6 +1147,7 @@ input{font:inherit;outline:none}
 <button class="btn btn-invite" id="invite-btn" style="font-size:0.7rem;padding:8px 14px;">🔗 Davet linkini kopyala</button>
 <div id="invite-msg" style="display:none;font-size:0.68rem;opacity:0.7;margin-top:4px;text-align:center;"></div>
 <button class="btn btn-gold" id="start-btn" style="display:none;">🎮 Oyunu Başlat</button>
+<button class="btn btn-small" id="bot-btn" style="display:none;background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;margin-top:6px;">🤖 Bot Ekle</button>
 <button class="btn btn-small" id="leave-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;margin-top:6px;">Odadan Ayrıl</button>
 </div>
 
@@ -1135,30 +1311,54 @@ function copyInvite(){
     try{const ta=document.createElement('textarea');ta.value=link;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()}catch(e){prompt('Linki kopyala:',link)}
   }
 }
+// ========== READY ==========
+function toggleReady(){
+  if(!gameId||!uid)return;
+  const cur=!!((stateCache||{}).readyPlayers||{})[uid];
+  api('POST','/api/rooms/'+gameId+'/ready',{uid,ready:!cur}).then(r=>{
+    if(!r.ok)return;
+  }).catch(()=>{});
+}
 // Lobide ekrani state'ten ciz (her poll'da cagrilir)
 function renderRoom(g){
   if(!g||!g.players)return;
   isHost = (g.host === uid);
   const list=document.getElementById('player-list');
   const cnt=Object.keys(g.players).length;
+  const readyMap=g.readyPlayers||{};
+  let readyCount=0;
   let h='';
   Object.keys(g.players).forEach(u=>{
-    const p=g.players[u],me=u===uid,host=u===g.host;
-    h+=`<div class="pl-item"><span>${host?'👑':'✅'}</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}${host?' - kurucu':''}</span></div>`;
+    const p=g.players[u],me=u===uid,host=u===g.host,isBot=!!p.isBot;
+    const isReady=!!readyMap[u];
+    if(isReady)readyCount++;
+    const badge=host?'<span>👑</span>':'';
+    const botBadge=isBot?'<span>🤖</span>':'';
+    const readyBadge=isReady?'<span style="color:#2fbf71;font-weight:700;">✔ Hazır</span>':'<span style="opacity:0.55;">⏳</span>';
+    const myBtn=me&&!host?' <button class="btn btn-small" style="padding:6px 12px;margin-left:6px;" onclick="toggleReady()">'+(isReady?'Hazır Değil':'Hazır')+'</button>':'';
+    h+=`<div class="pl-item"><span>${badge}${botBadge}</span><span class="pln">${esc(p.nickname)}${me?' (Sen)':''}${host?' - kurucu':''}</span>${readyBadge}${myBtn}</div>`;
   });
   list.innerHTML=h;
   const sb=document.getElementById('start-btn');
+  const bb=document.getElementById('bot-btn');
   if(isHost){
+    const allReady = cnt>=2 && readyCount===cnt;
     sb.style.display='block';
-    sb.disabled = cnt<2;
-    sb.textContent = cnt>=2 ? '🎮 Oyunu Başlat ('+cnt+'/4)' : 'En az 2 oyuncu ('+cnt+'/4)';
+    sb.disabled = !allReady;
+    sb.textContent = allReady ? '🎮 Oyunu Başlat' : `Hazırlanıyor... (${readyCount}/${cnt})`;
+    const botCount = Object.values(g.players||{}).filter(p=>p.isBot).length;
+    bb.style.display='block';
+    bb.textContent = botCount >= 2 ? '🤖 Botlar Dolu' : '🤖 Bot Ekle';
+    bb.disabled = botCount >= 2;
   }else{
     sb.style.display='none';
+    bb.style.display='none';
   }
   const hd=document.getElementById('room-hint');
   if(hd){
+    const botCount = Object.values(g.players||{}).filter(p=>p.isBot).length;
     hd.textContent = isHost
-      ? (cnt>=2 ? 'Sen kurucusun 👑 Başlat’a basabilirsin' : 'Sen kurucusun 👑 Arkadaşını bekle (2 kişi gerekli)')
+      ? (cnt>=2 ? 'Hazırlık kontrolü 👑' : 'Sen kurucusun 👑 Arkadaşını bekle (2 kişi gerekli)') + (botCount ? ` (${botCount} bot)` : '')
       : 'Kurucunun başlatması bekleniyor...';
   }
   st('Oyuncu: '+cnt+'/4');
@@ -1400,6 +1600,13 @@ document.addEventListener('DOMContentLoaded',()=>{
   });
   document.getElementById('leave-btn').addEventListener('click',leaveRoom);
   document.getElementById('invite-btn').addEventListener('click',copyInvite);
+  document.getElementById('bot-btn').addEventListener('click',()=>{
+    if(!isHost||!gameId)return;
+    api('POST','/api/rooms/'+gameId+'/bots',{uid,action:'add'}).then(r=>{
+      if(!r.ok)return;
+      loadPlayers();
+    }).catch(()=>{});
+  });
   document.getElementById('game-exit-btn').addEventListener('click',()=>{
     if(!gameId)return;
     if(confirm('Oyundan ayrılmak istediğine emin misin? Lobiye döneceksin.'))leaveRoom();
@@ -1466,6 +1673,7 @@ if __name__ == '__main__':
     threading.Thread(target=janitor, daemon=True).start()
     threading.Thread(target=reaper, daemon=True).start()
     threading.Thread(target=start_ws_server, daemon=True).start()
+    threading.Thread(target=bot_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
