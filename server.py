@@ -21,7 +21,7 @@ import asyncio
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v22-stats'
+APP_VERSION = 'v24-boardtheme'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
