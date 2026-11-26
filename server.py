@@ -21,7 +21,7 @@ import asyncio
 import os
 PORT = int(os.environ.get('PORT', '8080'))
 HOST = '0.0.0.0'
-APP_VERSION = 'v24-boardtheme'
+APP_VERSION = 'v26-afk-clockfix'
 
 # ============================================================
 # OYUN DURUMU (bellekte)
@@ -72,6 +72,7 @@ def build_public_state(game, uid):
         'winner': game.get('winner'),
         'status': game.get('status', 'lobby'),
         'host': game.get('host'),
+        'now': int(time.time() * 1000),
     }
     for puid, p in game.get('players', {}).items():
         state['players'][puid] = {
@@ -395,6 +396,91 @@ def janitor():
             pass
 
 # ============================================================
+# AFK CEZASI: top kimdeyse 10 dk oynamazsa 1 can duser
+# ============================================================
+AFK_TIMEOUT_SEC = 600  # 10 dakika (dakika degistirmek icin burayi degistir)
+
+_afk_seen = {}  # gid -> {'sig': (phase, ebe), 'since': ts}
+
+def afk_penalty(gid):
+    game = games.get(gid)
+    if not game or game.get('status') != 'playing':
+        return
+    ebe = game.get('currentEbe')
+    players = game.get('players', {})
+    if not ebe or ebe not in players:
+        return
+    p = players[ebe]
+    nick = p.get('nickname', '?')
+    p['lives'] = max(0, int(p.get('lives', 0)) - 1)
+    eliminated = p['lives'] <= 0
+    if eliminated:
+        p['eliminated'] = True
+        game.setdefault('eliminated', {})[ebe] = True
+    msg = (f'⌛ {nick} süre doldu, elendi!' if eliminated else f'⌛ {nick} süre doldu, can kaybetti!')
+    game['message'] = msg
+    for u in players:
+        add_notification(u, msg, 'eliminate' if eliminated else 'hit')
+
+    alive = [u for u, pl in players.items() if not pl.get('eliminated') and pl.get('lives', 0) > 0]
+    if len(alive) <= 1:
+        winner = alive[0] if alive else None
+        game['status'] = 'finished'
+        game['phase'] = 'result'
+        game['winner'] = winner
+        game['currentEbe'] = None
+        game['targetPlayer'] = None
+        game['selectedColor'] = None
+        game['catchDeadline'] = 0
+        game['colorDeadline'] = 0
+        if winner:
+            game['message'] = f'🏆 {players[winner]["nickname"]} oyunu KAZANDI!'
+        for u, pl in players.items():
+            s = stats.setdefault(u, {'wins': 0, 'games': 0, 'nick': pl.get('nickname', '?')})
+            s['games'] += 1
+            s['nick'] = pl.get('nickname', s.get('nick', '?'))
+            if u == winner:
+                s['wins'] += 1
+            add_notification(u, f'🏆 {players[winner]["nickname"]} oyunu KAZANDI!' if winner else 'Oyun bitti', 'win')
+    else:
+        ne = random.choice(alive)
+        game['currentEbe'] = ne
+        game['phase'] = 'ebe_turn'
+        game['targetPlayer'] = None
+        game['selectedColor'] = None
+        game['catchDeadline'] = 0
+        game['colorDeadline'] = 0
+        game['colorHitOrder'] = {}
+        for u in players:
+            players[u]['isEbe'] = (u == ne)
+        game['message'] = msg + f' 👑 {players[ne]["nickname"]} yeni ebe!'
+    game['phaseVersion'] = game.get('phaseVersion', 0) + 1
+    broadcast_state(gid)
+
+def afk_tick():
+    now = time.time()
+    for gid, game in list(games.items()):
+        if game.get('status') != 'playing':
+            _afk_seen.pop(gid, None)
+            continue
+        sig = (game.get('phase'), game.get('currentEbe'))
+        rec = _afk_seen.get(gid)
+        if not rec or rec.get('sig') != sig:
+            _afk_seen[gid] = {'sig': sig, 'since': now}
+            continue
+        if game.get('phase') == 'ebe_turn' and (now - rec['since']) >= AFK_TIMEOUT_SEC:
+            afk_penalty(gid)
+            _afk_seen[gid] = {'sig': (game.get('phase'), game.get('currentEbe')), 'since': now}
+
+def afk_loop():
+    while True:
+        time.sleep(5)
+        try:
+            afk_tick()
+        except Exception:
+            pass
+
+# ============================================================
 # SUNUCU
 # ============================================================
 class ThreadedServer(ThreadingMixIn, http.server.HTTPServer):
@@ -545,6 +631,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'winner': game.get('winner'),
                 'status': game.get('status', 'lobby'),
                 'host': game.get('host'),
+                'now': int(time.time() * 1000),
             }
 
             for puid, p in game.get('players', {}).items():
@@ -1268,6 +1355,7 @@ const BUILD='__BUILD__';
 console.log('ISTOP build',BUILD);
 let uid=null,nick='',gameId=null,isHost=false,ebem=false,eliminated=false,lastVer=0;
 let curPhase=null,timers=[],myHit=false,stateCache={},pollTimer=null,pendingInvite=null,prevLives={};
+let clockSkew=0;
 function clrT(){timers.forEach(t=>clearTimeout(t));timers=[]}
 function sc(id){['screen-nick','screen-lobby','screen-room','screen-game','screen-result'].forEach(s=>{const e=document.getElementById(s);if(e)e.style.display=s===id?'flex':'none'})}
 function msg(t){const e=document.getElementById('msg');if(e)e.textContent=t}
@@ -1505,6 +1593,7 @@ function applyGameState(g){
   if(!g)return;
   if(g.host){isHost = (g.host === uid);}
   stateCache=g;
+  if(g.now)clockSkew=g.now-Date.now();
   if(g.status==='deleted'){leaveRoom();return}
   if(!g.players||!g.players[uid]){leaveRoom();return}
   if(g.phaseVersion>lastVer){lastVer=g.phaseVersion;clrT();myHit=false;}
@@ -1605,11 +1694,11 @@ function throwTo(tu){
 function phCatch(g,ac,fresh){
   if(g.targetPlayer===uid&&!eliminated){
     if(!fresh)return;
-    const rem=Math.max(0,Math.floor((g.catchDeadline-Date.now())/1000));
+    const rem=Math.max(0,Math.min(6,Math.floor((g.catchDeadline-(Date.now()+clockSkew))/1000)));
     ac.innerHTML=`<div id="cd">${rem}</div><button id="catch-btn" onclick="doCatch()">🏀 YAKALA!</button>`;
     Snd.alert();vib();ntf('İstop','Sana top geldi!');
-    if(g.catchDeadline>Date.now()){
-      const iv=setInterval(()=>{const r=Math.max(0,Math.floor((g.catchDeadline-Date.now())/1000));const el=document.getElementById('cd');if(el)el.textContent=String(r);if(r<=0)clearInterval(iv);},150);
+    if(g.catchDeadline>(Date.now()+clockSkew)){
+      const iv=setInterval(()=>{const r=Math.max(0,Math.min(6,Math.floor((g.catchDeadline-(Date.now()+clockSkew))/1000)));const el=document.getElementById('cd');if(el)el.textContent=String(r);if(r<=0)clearInterval(iv);},150);
       timers.push(iv);timers.push(setTimeout(()=>clearInterval(iv),5000));
     }
   }else if(fresh){ac.innerHTML='<div style="opacity:0.5;font-size:1rem;">⏳ Top yolda...</div>'}
@@ -1830,6 +1919,7 @@ if __name__ == '__main__':
     threading.Thread(target=reaper, daemon=True).start()
     threading.Thread(target=start_ws_server, daemon=True).start()
     threading.Thread(target=bot_loop, daemon=True).start()
+    threading.Thread(target=afk_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
