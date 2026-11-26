@@ -487,7 +487,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         'full': pc >= 4,
                         'hasHost': g.get('host') is not None,
                         'message': g.get('message', ''),
-                        'phase': g.get('phase', 'waiting')
+                        'phase': g.get('phase', 'waiting'),
+                        'boardTheme': g.get('boardTheme', 'felt'),
                     })
             room_list.sort(key=lambda r: r.get('_id', ''), reverse=True)
             self._send({'ok': True, 'rooms': room_list})
@@ -557,6 +558,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             state['colorHitOrder'] = dict(game.get('colorHitOrder', {}))
             state['readyPlayers'] = dict(game.get('readyPlayers', {}))
             state['notifications'] = notifications.get(uid, [])[-20:]
+            state['boardTheme'] = game.get('boardTheme', 'felt')
             self._send({'ok': True, 'state': state, 'me': me, 'version': game.get('phaseVersion', 0)})
             return
 
@@ -607,6 +609,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'winner': None,
                 'colorHitOrder': {},
                 'readyPlayers': {},
+                'boardTheme': 'felt',
                 'players': {
                     uid: {
                         'nickname': nick,
@@ -849,6 +852,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             game['message'] = f'🎯 {game["players"][uid]["nickname"]} topu yakaladı! Yeni ebe!'
             game['phaseVersion'] += 1
             self._send({'ok': True})
+            broadcast_state(gid)
+            return
+
+        # --- TAHTA TEMA ---
+        if path.startswith('/api/game/') and path.endswith('/theme'):
+            parts = path.split('/')
+            if len(parts) < 4:
+                self._error('Bad path')
+                return
+            gid = parts[3]
+            uid = body.get('uid', '')
+            theme = body.get('theme', '')
+            game = games.get(gid)
+            if not game:
+                self._error('Oyun bulunamadı')
+                return
+            if game.get('host') != uid:
+                self._error('Sadece ev sahibi tema değiştirebilir')
+                return
+            if theme not in ('felt', 'neon', 'wood'):
+                self._error('Geçersiz tema')
+                return
+            game['boardTheme'] = theme
+            game['phaseVersion'] += 1
+            self._send({'ok': True, 'theme': theme})
             broadcast_state(gid)
             return
 
@@ -1205,6 +1233,7 @@ input{font:inherit;outline:none}
 <div class="player-list" id="player-list"></div>
 <button class="btn btn-invite" id="invite-btn" style="font-size:0.7rem;padding:8px 14px;">🔗 Davet linkini kopyala</button>
 <div id="invite-msg" style="display:none;font-size:0.68rem;opacity:0.7;margin-top:4px;text-align:center;"></div>
+<div id="theme-bar" style="display:none;gap:6px;margin-top:6px;"></div>
 <button class="btn btn-gold" id="start-btn" style="display:none;">🎮 Oyunu Başlat</button>
 <button class="btn btn-small" id="bot-btn" style="display:none;background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;margin-top:6px;">🤖 Bot Ekle</button>
 <button class="btn btn-small" id="leave-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;margin-top:6px;">Odadan Ayrıl</button>
@@ -1309,7 +1338,8 @@ function pollRooms(){
     let h='';
     r.rooms.forEach(e=>{
       const ok=!e.full&&e.playerCount<4;
-      h+=`<div class="room-item"><div class="ri">Oda #${e.id.substring(0,6)} <small>(${e.playerCount}/4)</small></div><button class="join-btn" data-id="${e._id}" ${ok?'':'disabled'}>${ok?'Katıl':'DOLU'}</button></div>`;
+      const themeLabel = e.boardTheme==='neon'?'霓':e.boardTheme==='wood'?'木':'牌';
+      h+=`<div class="room-item"><div class="ri">Oda #${e.id.substring(0,6)} <small>(${e.playerCount}/4)</small> <small style="opacity:0.6;">${themeLabel}</small></div><button class="join-btn" data-id="${e._id}" ${ok?'':'disabled'}>${ok?'Katıl':'DOLU'}</button></div>`;
     });
     list.innerHTML=h;
     Array.from(document.querySelectorAll('.join-btn')).forEach(b=>b.addEventListener('click',()=>joinRoom(b.dataset.id)));
@@ -1378,6 +1408,38 @@ function copyInvite(){
     try{const ta=document.createElement('textarea');ta.value=link;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done()}catch(e){prompt('Linki kopyala:',link)}
   }
 }
+// ========== TAHTA TEMA ==========
+function changeTheme(theme){
+  if(!isHost||!gameId)return;
+  api('POST','/api/game/'+gameId+'/theme',{uid,theme}).then(r=>{
+    if(!r.ok)return;
+  }).catch(()=>{});
+}
+function renderThemeBar(g){
+  const bar=document.getElementById('theme-bar');
+  if(!bar||!isHost||!g)return;
+  const cur=g.boardTheme||'felt';
+  bar.style.display='flex';
+  bar.innerHTML='';
+  ['felt','neon','wood'].forEach(t=>{
+    const b=document.createElement('button');
+    b.className='btn btn-small';
+    b.style.padding='6px 10px';
+    b.style.margin='0';
+    b.textContent = t==='felt'?'Kırmızı':t==='neon'?'Neon':'Ahşap';
+    if(cur===t){
+      b.style.border='1px solid #f7e9b8';
+      b.style.background='linear-gradient(180deg,#f0d489,#d4af37)';
+      b.style.color='#2a1a05';
+    }else{
+      b.style.background='rgba(0,0,0,0.35)';
+      b.style.border='1px solid rgba(212,175,55,0.4)';
+      b.style.color='#f3ead8';
+    }
+    b.onclick=()=>changeTheme(t);
+    bar.appendChild(b);
+  });
+}
 // ========== READY ==========
 function toggleReady(){
   if(!gameId||!uid)return;
@@ -1408,6 +1470,7 @@ function renderRoom(g){
   list.innerHTML=h;
   const sb=document.getElementById('start-btn');
   const bb=document.getElementById('bot-btn');
+  renderThemeBar(g);
   if(isHost){
     const allReady = cnt>=2 && readyCount===cnt;
     sb.style.display='block';
