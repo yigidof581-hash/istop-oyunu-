@@ -29,6 +29,7 @@ APP_VERSION = 'v20-ws'
 games = {}
 nick_uids = {}  # nickname -> uid (çakışma önleme)
 bots = {}       # game_id -> set of bot uids
+stats = {}      # uid -> {'wins':0,'games':0,'nick':''}
 
 # ============================================================
 # WEBSOCKET + KEEP-ALIVE
@@ -304,6 +305,12 @@ def remove_player(game, uid):
         game['catchDeadline'] = 0
         game['colorDeadline'] = 0
         game['message'] = (f'🏆 {players[winner]["nickname"]} oyunu KAZANDI!' if winner else 'Oyun bitti')
+        for u, p in players.items():
+            s = stats.setdefault(u, {'wins': 0, 'games': 0, 'nick': p.get('nickname', '?')})
+            s['games'] += 1
+            s['nick'] = p.get('nickname', s.get('nick', '?'))
+            if u == winner:
+                s['wins'] += 1
         return True
 
     # Ebe kactiysa yeni ebe secilir
@@ -433,6 +440,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Keep-alive ping
         if path == '/api/ping':
             self._send({'ok': True, 'pong': True, 'time': time.time()})
+            return
+
+        # Istatistik
+        if path == '/api/stats':
+            target = params.get('uid', [None])[0]
+            data = {}
+            if target:
+                data[target] = stats.get(target, {'wins': 0, 'games': 0, 'nick': ''})
+            else:
+                data = {u: {'wins': s.get('wins', 0), 'games': s.get('games', 0), 'nick': s.get('nick', '')} for u, s in stats.items()}
+            self._send({'ok': True, 'stats': data})
             return
 
         # Oda listesi
@@ -990,6 +1008,12 @@ def resolve_color_battle(gid):
             game['winner'] = winner
             game['message'] = f'🏆 {pls[winner]["nickname"]} oyunu KAZANDI!'
             game['phaseVersion'] += 1
+            for u, p in pls.items():
+                s = stats.setdefault(u, {'wins': 0, 'games': 0, 'nick': p.get('nickname', '?')})
+                s['games'] += 1
+                s['nick'] = p.get('nickname', s.get('nick', '?'))
+                if u == winner:
+                    s['wins'] += 1
             broadcast_state(gid)
             return
 
@@ -1137,6 +1161,7 @@ input{font:inherit;outline:none}
 <div class="lbl" style="margin-top:-8px;">── ODALAR ──</div>
 <div class="room-list" id="room-list"><div style="opacity:0.5;text-align:center;padding:10px;">Yükleniyor...</div></div>
 <button class="btn btn-gold" id="create-btn">➕ Yeni Oda</button>
+<button class="btn btn-small" id="stats-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;">📊 İstatistik</button>
 <button class="btn btn-small" id="logout-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;">Çıkış</button>
 </div>
 
@@ -1162,7 +1187,14 @@ input{font:inherit;outline:none}
 <div class="title">🏆</div>
 <div class="sub"></div>
 <button class="btn btn-gold" id="rematch-btn" style="width:80%;max-width:240px;">Tekrar Oyna</button>
+<button class="btn btn-small" id="result-stats-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;max-width:240px;">📊 İstatistik</button>
 <button class="btn btn-small" id="result-leave-btn" style="background:rgba(0,0,0,0.35);border:1px solid rgba(212,175,55,0.4);color:#f3ead8;max-width:240px;">Odadan Ayrıl</button>
+</div>
+
+<div id="screen-stats" class="screen">
+<div class="lbl" style="margin-top:-8px;">── İSTATİSTİK ──</div>
+<div id="stats-list" style="width:100%;max-width:360px;max-height:70vh;overflow-y:auto;"></div>
+<button class="btn btn-gold" id="stats-close-btn" style="width:80%;max-width:240px;">Kapat</button>
 </div>
 
 </div>
@@ -1525,6 +1557,20 @@ function showResult(g){
   Snd.win();
   confettiBurst();
 }
+// ========== ISTATISTIK ==========
+function openStats(){
+  sc('screen-stats');
+  api('GET','/api/stats?uid='+uid).then(r=>{
+    if(!r.ok||!r.stats)return;
+    const data=r.stats[uid]||{wins:0,games:0,nick:''};
+    const winRate=data.games?Math.round(data.wins/data.games*100):0;
+    document.getElementById('stats-list').innerHTML=`<div class="pl-item"><span class="pln">Toplam Oyun</span><span>${data.games}</span></div><div class="pl-item"><span class="pln">Kazanma</span><span>${data.wins}</span></div><div class="pl-item"><span class="pln">Kazanma Oranı</span><span>%${winRate}</span></div>`;
+  }).catch(()=>{});
+}
+function closeStats(){
+  sc('screen-lobby');
+  startLobbyPoll();
+}
 // Kazanan ekranina konfeti
 function confettiBurst(){
   const host=document.getElementById('app');
@@ -1591,6 +1637,12 @@ document.addEventListener('DOMContentLoaded',()=>{
     }).catch(e=>{alert('Bağlantı hatası: '+e.message);inp.disabled=false;document.getElementById('nick-btn').disabled=false;});
   }
   document.getElementById('create-btn').addEventListener('click',createRoom);
+  document.getElementById('stats-btn').addEventListener('click',()=>{
+    if(!uid)return;
+    stopLobbyPoll();
+    openStats();
+  });
+  document.getElementById('stats-close-btn').addEventListener('click',closeStats);
   document.getElementById('logout-btn').addEventListener('click',doLogout);
   document.getElementById('start-btn').addEventListener('click',()=>{
     if(!isHost||!gameId)return;
@@ -1617,6 +1669,10 @@ document.addEventListener('DOMContentLoaded',()=>{
     else{curPhase=null;resultShown=false;sc('screen-room');pollGame();}
   });
   document.getElementById('result-leave-btn').addEventListener('click',leaveRoom);
+  document.getElementById('result-stats-btn').addEventListener('click',()=>{
+    if(!uid)return;
+    openStats();
+  });
 
   // --- Davet linki (#oda=XXX) algila ---
   try{
